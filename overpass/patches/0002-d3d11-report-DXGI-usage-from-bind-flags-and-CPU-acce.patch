@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 19:20:19 +0100
+Subject: [PATCH] d3d11: report DXGI usage from bind flags and CPU access
+
+IDXGIResource::GetUsage always returned 0. ANGLE checks the result for
+DXGI_USAGE_RENDER_TARGET_OUTPUT before rendering into a texture it is handed,
+so Chromium-based apps that share textures with ANGLE (Qt WebEngine, CEF)
+could not draw: "Unable to initialize SkSurface", then a crash. GetUsage now
+derives shader input, render target output and unordered access from the bind
+flags, and the CPU access bits from the D3D11 usage.
+---
+ src/d3d11/d3d11_resource.hpp | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
+index 9a5a692..b9bd304 100644
+--- a/src/d3d11/d3d11_resource.hpp
++++ b/src/d3d11/d3d11_resource.hpp
+@@ -290,11 +290,26 @@ public:
+     return device->QueryInterface(riid, ppDevice);
+   };
+ 
++  // What the resource can be used for, as DXGI describes it: from its bind flags and CPU access.
++  // ANGLE checks DXGI_USAGE_RENDER_TARGET_OUTPUT before rendering into a texture it was handed.
+   virtual HRESULT GetDXGIUsage(DXGI_USAGE *pUsage) {
+-    if (!pUsage) {
++    if (!pUsage)
+       return E_INVALIDARG;
+-    }
+-    *pUsage = 0;
++
++    DXGI_USAGE usage = DXGI_CPU_ACCESS_NONE;
++    if (desc.Usage == D3D11_USAGE_DYNAMIC)
++      usage = DXGI_CPU_ACCESS_DYNAMIC;
++    else if (desc.Usage == D3D11_USAGE_STAGING)
++      usage = DXGI_CPU_ACCESS_READ_WRITE;
++
++    if (desc.BindFlags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_CONSTANT_BUFFER))
++      usage |= DXGI_USAGE_SHADER_INPUT;
++    if (desc.BindFlags & D3D11_BIND_RENDER_TARGET)
++      usage |= DXGI_USAGE_RENDER_TARGET_OUTPUT;
++    if (desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)
++      usage |= DXGI_USAGE_UNORDERED_ACCESS;
++
++    *pUsage = usage;
+     return S_OK;
+   }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

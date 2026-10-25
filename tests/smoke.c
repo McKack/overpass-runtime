@@ -35,6 +35,21 @@ int main(void)
     PFN_D3D11_CREATE_DEVICE create11 = (void *)GetProcAddress(LoadLibraryA("d3d11.dll"), "D3D11CreateDevice");
     hr = create11 ? create11(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev11, &fl11, NULL) : E_FAIL;
     CHECK(SUCCEEDED(hr), "d3d11: device hr=%#lx feature level %#x", hr, fl11);
+    if (dev11)
+    {
+        /* ANGLE (Chromium, Qt WebEngine) only renders into a shared texture whose DXGI usage says it can. */
+        D3D11_TEXTURE2D_DESC td = { 64, 64, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
+                                    D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0,
+                                    D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE };
+        ID3D11Texture2D *tex = NULL; IDXGIResource *res = NULL; DXGI_USAGE usage = 0;
+        hr = ID3D11Device_CreateTexture2D(dev11, &td, NULL, &tex);
+        if (SUCCEEDED(hr)) hr = ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIResource, (void **)&res);
+        if (SUCCEEDED(hr)) hr = IDXGIResource_GetUsage(res, &usage);
+        CHECK(SUCCEEDED(hr) && usage == (DXGI_USAGE_SHADER_INPUT | DXGI_USAGE_RENDER_TARGET_OUTPUT),
+              "d3d11: shared render target's DXGI usage %#x (%#x expected)", usage, DXGI_USAGE_SHADER_INPUT | DXGI_USAGE_RENDER_TARGET_OUTPUT);
+        if (res) IDXGIResource_Release(res);
+        if (tex) ID3D11Texture2D_Release(tex);
+    }
 
     /* D3D12 */
     ID3D12Device *dev12 = NULL; ID3D12CommandQueue *queue = NULL;

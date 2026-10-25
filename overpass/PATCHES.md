@@ -7,5 +7,6 @@ To start over from a clean DXMT, run `git -C dxmt checkout -- . && git -C dxmt c
 | Patch | What it does |
 |---|---|
 | `0001-nvapi-add-D3D12-DRS-D3D11-device-creation-and-GPU-di.patch` | Adds 36 NVAPI functions: D3D12 (shader extension and raytracing caps, Reflex queue calls, pipeline options), DRS sessions and profiles, `NvAPI_D3D11_CreateDevice(AndSwapChain)`, `NvAPI_D3D_RegisterDevice`, and GPU/display lookups (PCI IDs, GPU type and info, GPU IDs, logical/physical GPUs, display names). Behaviour adapted from dxvk-nvapi (MIT); the notice is kept in `src/nvapi/nvapi_ported.cpp`. |
+| `0002-d3d11-report-DXGI-usage-from-bind-flags-and-CPU-acce.patch` | `IDXGIResource::GetUsage` reports what the resource can be used for (shader input, render target output, unordered access, CPU access) instead of 0. ANGLE checks it before rendering into a shared texture, so Chromium-based apps such as GOG Galaxy (Qt WebEngine) failed with "Unable to initialize SkSurface" and crashed. Verified: GOG Galaxy 2.1.10 shows its login window on DXMT. |
 
 Verify with `tests/smoke.c` (run it with `DXMT_ENABLE_NVEXT=1` for the NVAPI checks).
