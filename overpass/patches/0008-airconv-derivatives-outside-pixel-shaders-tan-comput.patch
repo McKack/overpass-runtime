@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:42:31 +0100
+Subject: [PATCH] airconv: derivatives outside pixel shaders; tan computed sin
+
+SM 6.6 compute shaders may take derivatives over 2x2 thread quads. Metal has
+dfdx/dfdy only in fragment functions, so outside pixel shaders a derivative is
+the difference with the quad neighbour: the adjacent lane in x, and in y the
+lane a thread-group row away (two lanes in 1D groups). Coarse derivatives are
+computed as fine ones.
+
+Also fixes the DXIL tan op, which was translated to sin.
+---
+ src/airconv/nt/dxil_converter_base.cpp | 39 +++++++++++++++++++++++++-
+ src/airconv/nt/dxil_converter_base.hpp |  1 +
+ 2 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
+index c4f5070..6a8eb4f 100644
+--- a/src/airconv/nt/dxil_converter_base.cpp
++++ b/src/airconv/nt/dxil_converter_base.cpp
+@@ -1994,6 +1994,8 @@ Converter::EmitUnary(const CallInst &Call) {
+   case kOpDerivFineY:
+     if (!(*Operand)->getType()->isFloatingPointTy())
+       return unsupported("dxil: derivative on a non-float operand");
++    if (ctx.shader_type != microsoft::D3D10_SB_PIXEL_SHADER)
++      return EmitQuadDerivative(*Operand, OpId == kOpDerivCoarseY || OpId == kOpDerivFineY);
+     return air.CreateDerivative(*Operand, OpId == kOpDerivCoarseY || OpId == kOpDerivFineY);
+   case kOpFAbs:
+     FPUnOp = AIRBuilder::fabs;
+@@ -2008,7 +2010,7 @@ Converter::EmitUnary(const CallInst &Call) {
+     FPUnOp = AIRBuilder::sin;
+     break;
+   case kOpTan:
+-    FPUnOp = AIRBuilder::sin;
++    FPUnOp = AIRBuilder::tan;
+     break;
+   case kOpAcos:
+     FPUnOp = AIRBuilder::acos;
+@@ -2783,4 +2785,39 @@ Converter::EmitPackedMath(const CallInst &Call) {
+   }
+ }
+ 
++// Derivatives outside pixel shaders (SM 6.6 compute): Metal only has dfdx/dfdy in fragment functions, so
++// difference with the quad neighbour. D3D's compute quads are 2x2 blocks of the thread group, or 4 consecutive
++// threads (as 2x2) for 1D groups. Lanes follow the linear thread index, so the x neighbour is the adjacent lane
++// and the y neighbour is a row away (2 lanes in 1D groups). Coarse derivatives are computed as fine ones.
++llvm::Value *
++Converter::EmitQuadDerivative(llvm::Value *V, bool YAxis) {
++  uint32_t Width = 1, Height = 1;
++  for (auto &Property : entry.properties)
++    if (Property.tag == EntryPropertyTag::NumThreads) {
++      Width = Property.num_threads.x;
++      Height = Property.num_threads.y;
++    }
++  auto *I32 = ir.getInt32Ty();
++  auto *Lane = air.CreateGetBuiltinID("get_thread_index_in_simdgroup");
++  auto Shuffle = [&](Value *LaneId) {
++    return SimdCall("air.simd_shuffle" + SimdSuffix(V->getType(), false), V->getType(), {V, ir.CreateTrunc(LaneId, ir.getInt16Ty())});
++  };
++  Value *Odd, *Partner;
++  if (!YAxis) {
++    Odd = ir.CreateICmpNE(ir.CreateAnd(Lane, ir.getInt32(1)), ir.getInt32(0));
++    Partner = Shuffle(ir.CreateXor(Lane, ir.getInt32(1)));
++  } else if (Height <= 1) {
++    Odd = ir.CreateICmpNE(ir.CreateAnd(Lane, ir.getInt32(2)), ir.getInt32(0));
++    Partner = Shuffle(ir.CreateXor(Lane, ir.getInt32(2)));
++  } else {
++    auto *Y = air.CreateGetLocalID(1);
++    Odd = ir.CreateICmpNE(ir.CreateAnd(Y, ir.getInt32(1)), ir.getInt32(0));
++    auto *Row = ir.getInt32(Width);
++    Partner = Shuffle(ir.CreateSelect(Odd, ir.CreateSub(Lane, Row), ir.CreateAdd(Lane, Row)));
++  }
++  (void)I32;
++  // value at the higher coordinate minus value at the lower one
++  return ir.CreateSelect(Odd, ir.CreateFSub(V, Partner), ir.CreateFSub(Partner, V));
++}
++
+ } // namespace dxmt::dxil
+diff --git a/src/airconv/nt/dxil_converter_base.hpp b/src/airconv/nt/dxil_converter_base.hpp
+index a1247cf..67a0148 100644
+--- a/src/airconv/nt/dxil_converter_base.hpp
++++ b/src/airconv/nt/dxil_converter_base.hpp
+@@ -111,6 +111,7 @@ private:
+   llvm::Expected<llvm::Value *> EmitQuadOp(const llvm::CallInst &Call);
+   llvm::Expected<llvm::Value *> EmitWaveOp(const llvm::CallInst &Call, llvm::StringRef Op);
+   llvm::Expected<llvm::Value *> EmitPackedMath(const llvm::CallInst &Call);
++  llvm::Value *EmitQuadDerivative(llvm::Value *V, bool YAxis);
+   llvm::Value *SimdCall(const std::string &Name, llvm::Type *RetTy, llvm::ArrayRef<llvm::Value *> Args);
+   std::string SimdSuffix(llvm::Type *Ty, bool Signed);
+   llvm::Value *LaneMask(llvm::Type *StructTy, llvm::Value *Mask64);
+-- 
+2.50.1 (Apple Git-155)
+
