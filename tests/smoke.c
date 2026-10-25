@@ -42,16 +42,23 @@ int main(void)
     if (dev12)
     {
         D3D12_FEATURE_DATA_SHADER_MODEL sm = { (D3D_SHADER_MODEL)0x68 };
+        D3D12_FEATURE_DATA_D3D12_OPTIONS o0 = {0};
         D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5 = {0};
         D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7 = {0};
         D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
         D3D12_FEATURE_DATA_FEATURE_LEVELS fls = { ARRAYSIZE(levels), levels, 0 };
-        ID3D12Device_CheckFeatureSupport(dev12, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm));
+        /* Like games do: ask for the newest model, step down while the device calls the request unknown. */
+        while (sm.HighestShaderModel > D3D_SHADER_MODEL_5_1 &&
+               ID3D12Device_CheckFeatureSupport(dev12, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)) == E_INVALIDARG)
+            sm.HighestShaderModel = sm.HighestShaderModel == 0x60 ? D3D_SHADER_MODEL_5_1 : sm.HighestShaderModel - 1;
         ID3D12Device_CheckFeatureSupport(dev12, D3D12_FEATURE_FEATURE_LEVELS, &fls, sizeof(fls));
+        ID3D12Device_CheckFeatureSupport(dev12, D3D12_FEATURE_D3D12_OPTIONS, &o0, sizeof(o0));
         ID3D12Device_CheckFeatureSupport(dev12, D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5));
         ID3D12Device_CheckFeatureSupport(dev12, D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7));
         printf("info d3d12: max feature level %#x, shader model %#x, raytracing tier %d, mesh shader tier %d\n",
                fls.MaxSupportedFeatureLevel, sm.HighestShaderModel, o5.RaytracingTier, o7.MeshShaderTier);
+        printf("info d3d12: tiled resources tier %d, resource binding tier %d, conservative raster tier %d, ROVs %d\n",
+               o0.TiledResourcesTier, o0.ResourceBindingTier, o0.ConservativeRasterizationTier, o0.ROVsSupported);
 
         D3D12_COMMAND_QUEUE_DESC qd = { D3D12_COMMAND_LIST_TYPE_DIRECT };
         ID3D12CommandQueue *queue = NULL;
