@@ -28,7 +28,8 @@ Early. It builds on a Mac and passes its smoke test (`tests/smoke.c`) under Over
 - **D3D10/11 and DXGI:** DXMT's, unchanged.
 - **D3D12:** a device is created with feature level 11_1 and shader model 6.0. Games that need 12_0 or
   newer don't run yet.
-- **DLSS → MetalFX:** D3D11 only so far.
+- **DLSS → MetalFX:** Super Resolution in D3D11 and D3D12 games (D3D12 is OverPass's addition). Not yet:
+  ray reconstruction and frame generation.
 - **NVAPI:** DXMT's functions plus 36 more (D3D12, driver profile sessions, D3D11 device creation,
   GPU and display queries). Active with `DXMT_ENABLE_NVEXT=1`.
 

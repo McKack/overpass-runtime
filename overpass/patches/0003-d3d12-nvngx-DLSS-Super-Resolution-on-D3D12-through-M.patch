@@ -1,0 +1,699 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 19:36:43 +0100
+Subject: [PATCH] d3d12, nvngx: DLSS Super Resolution on D3D12 through MetalFX
+
+NGX now has D3D12 entry points. CreateFeature and EvaluateFeature use a new
+command list extension, IMTLD3D12CommandListExt, which records a MetalFX
+temporal upscale into the command list; the queue plays it back between its
+other passes. Motion vectors at output size (no MVLowRes flag) are first
+shrunk to render size by a compute pass. Scalers are cached per device and
+configuration, like the D3D11 path. Initialisation, parameters, capabilities
+and feature release share the D3D11 code.
+---
+ src/d3d12/d3d12_command_allocator.cpp |   3 +
+ src/d3d12/d3d12_command_encoder.hpp   |  14 ++
+ src/d3d12/d3d12_command_list.cpp      | 193 +++++++++++++++++++++++
+ src/d3d12/d3d12_command_queue.cpp     |  23 +++
+ src/d3d12/d3d12_device.cpp            |  58 +++++++
+ src/d3d12/d3d12_device.hpp            |  11 ++
+ src/d3d12/d3d12_interfaces.hpp        |  35 +++++
+ src/nvngx/meson.build                 |   1 +
+ src/nvngx/nvngx_d3d12.cpp             | 211 ++++++++++++++++++++++++++
+ 9 files changed, 549 insertions(+)
+ create mode 100644 src/d3d12/d3d12_interfaces.hpp
+ create mode 100644 src/nvngx/nvngx_d3d12.cpp
+
+diff --git a/src/d3d12/d3d12_command_allocator.cpp b/src/d3d12/d3d12_command_allocator.cpp
+index c218920..a80a2d1 100644
+--- a/src/d3d12/d3d12_command_allocator.cpp
++++ b/src/d3d12/d3d12_command_allocator.cpp
+@@ -134,6 +134,9 @@ MTLD3D12CommandAllocatorImpl::Reset() {
+       case EncoderType::Resolve:
+         reinterpret_cast<ResolveEncoderData *>(next)->~ResolveEncoderData();
+         break;
++      case EncoderType::TemporalUpscale:
++        reinterpret_cast<TemporalUpscaleEncoderData *>(next)->~TemporalUpscaleEncoderData();
++        break;
+       }
+       next = next->next;
+     }
+diff --git a/src/d3d12/d3d12_command_encoder.hpp b/src/d3d12/d3d12_command_encoder.hpp
+index 1caf3bc..9fef439 100644
+--- a/src/d3d12/d3d12_command_encoder.hpp
++++ b/src/d3d12/d3d12_command_encoder.hpp
+@@ -18,6 +18,7 @@
+ 
+ #pragma once
+ 
++#include "dxmt_scaler.hpp"
+ #include "dxmt_texture.hpp"
+ #include <cstdint>
+ 
+@@ -30,6 +31,7 @@ enum class EncoderType {
+   Blit,
+   Compute,
+   Resolve,
++  TemporalUpscale,
+ };
+ 
+ struct EncoderData {
+@@ -119,4 +121,16 @@ struct ResolveEncoderData : EncoderData {
+   TextureViewRef dst;
+ };
+ 
++// A MetalFX temporal upscale. Motion vectors are already at input resolution (a compute pass before it
++// shrinks display-resolution ones).
++struct TemporalUpscaleEncoderData : EncoderData {
++  TextureViewRef input;
++  TextureViewRef output;
++  TextureViewRef depth;
++  TextureViewRef motion_vector;
++  TextureViewRef exposure;
++  Rc<TemporalScaler> scaler;
++  WMTFXTemporalScalerProps props;
++};
++
+ }; // namespace dxmt
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index 1d54278..7b370b6 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "d3d12_command_allocator.hpp"
++#include "d3d12_interfaces.hpp"
+ #include "com/com_pointer.hpp"
+ #include "dxmt_format.hpp"
+ 
+@@ -149,6 +150,193 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
+   FLOAT blend_factor_[4];
+   UINT8 stencil_ref_;
+ 
++  // IMTLD3D12CommandListExt, used by nvngx for DLSS -> MetalFX.
++  class CommandListExt final : public IMTLD3D12CommandListExt {
++    MTLD3D12GraphicsCommandListImpl *list_;
++
++  public:
++    CommandListExt(MTLD3D12GraphicsCommandListImpl *list) : list_(list) {}
++
++    HRESULT STDMETHODCALLTYPE
++    QueryInterface(REFIID riid, void **ppvObject) final {
++      return list_->QueryInterface(riid, ppvObject);
++    }
++    ULONG STDMETHODCALLTYPE
++    AddRef() final {
++      return list_->AddRef();
++    }
++    ULONG STDMETHODCALLTYPE
++    Release() final {
++      return list_->Release();
++    }
++
++    BOOL STDMETHODCALLTYPE
++    TemporalUpscale(const MTL_TEMPORAL_UPSCALE_D3D12_DESC *pDesc) final {
++      return pDesc && list_->TemporalUpscale(*pDesc);
++    }
++
++    HRESULT STDMETHODCALLTYPE
++    CheckFeatureSupport(MTL_D3D12_FEATURE Feature, void *pFeatureSupportData, UINT FeatureSupportDataSize) final {
++      if (!pFeatureSupportData)
++        return E_INVALIDARG;
++      switch (Feature) {
++      case MTL_D3D12_FEATURE_METALFX_TEMPORAL_SCALER:
++        if (FeatureSupportDataSize != sizeof(BOOL))
++          return E_INVALIDARG;
++        *reinterpret_cast<BOOL *>(pFeatureSupportData) = list_->device_->GetMTLDevice().supportsFXTemporalScaler();
++        return S_OK;
++      }
++      return E_INVALIDARG;
++    }
++  } ext_{this};
++
++  // Motion vector formats MetalFX accepts, from the formats games render them in.
++  static WMTPixelFormat
++  MotionVectorFormat(WMTPixelFormat format) {
++    switch (format) {
++    case WMTPixelFormatRG16Uint:
++    case WMTPixelFormatRG16Float:
++    case WMTPixelFormatRG16Sint:
++    case WMTPixelFormatRG16Snorm:
++    case WMTPixelFormatRG16Unorm:
++      return WMTPixelFormatRG16Float;
++    case WMTPixelFormatRG32Uint:
++    case WMTPixelFormatRG32Float:
++    case WMTPixelFormatRG32Sint:
++      return WMTPixelFormatRG32Float;
++    case WMTPixelFormatRGBA16Sint:
++    case WMTPixelFormatRGBA16Snorm:
++    case WMTPixelFormatRGBA16Uint:
++    case WMTPixelFormatRGBA16Unorm:
++    case WMTPixelFormatRGBA16Float:
++      return WMTPixelFormatRGBA16Float;
++    default:
++      return WMTPixelFormatInvalid;
++    }
++  }
++
++  // The first mip and slice of a texture as a plain 2D view, which is what MetalFX takes.
++  static TextureViewRef
++  View2D(const Rc<Texture> &texture, WMTPixelFormat format) {
++    auto key = texture->createView(
++        {.format = format,
++         .type = WMTTextureType2D,
++         .firstMiplevel = 0,
++         .miplevelCount = 1,
++         .firstArraySlice = 0,
++         .arraySize = 1}
++    );
++    return &texture->view(key);
++  }
++
++  BOOL
++  TemporalUpscale(const MTL_TEMPORAL_UPSCALE_D3D12_DESC &Desc) {
++    auto texture_of = [](ID3D12Resource *pResource) -> Rc<Texture> {
++      return pResource ? static_cast<MTLD3D12Resource *>(pResource)->texture : nullptr;
++    };
++    Rc<Texture> input = texture_of(Desc.Color), output = texture_of(Desc.Output), depth = texture_of(Desc.Depth),
++                motion_vector = texture_of(Desc.MotionVector), exposure = texture_of(Desc.ExposureTexture);
++    if (!input || !output || !depth || !motion_vector || (Desc.ExposureTexture && !exposure))
++      return FALSE;
++
++    auto motion_vector_format = MotionVectorFormat(motion_vector->pixelFormat());
++    if (motion_vector_format == WMTPixelFormatInvalid) {
++      ERR("TemporalUpscale: unsupported motion vector format ", motion_vector->pixelFormat());
++      return FALSE;
++    }
++
++    WMTFXTemporalScalerInfo info{};
++    info.color_format = input->pixelFormat();
++    info.output_format = output->pixelFormat();
++    info.depth_format = depth->pixelFormat();
++    info.motion_format = motion_vector_format;
++    info.input_width = input->width();
++    info.input_height = input->height();
++    info.output_width = output->width();
++    info.output_height = output->height();
++    info.auto_exposure = Desc.AutoExposure;
++    info.input_content_properties_enabled = true;
++    info.input_content_min_scale = 1.0f;
++    info.input_content_max_scale = 3.0f;
++    info.requires_synchronous_initialization = true;
++    auto scaler = device_->GetTemporalScaler(info, Desc.MotionVectorInDisplayRes);
++
++    WMTFXTemporalScalerProps props{
++        Desc.InputContentWidth ? Desc.InputContentWidth : input->width(),
++        Desc.InputContentHeight ? Desc.InputContentHeight : input->height(),
++        (bool)Desc.InReset,
++        (bool)Desc.DepthReversed,
++        Desc.MotionVectorScaleX,
++        Desc.MotionVectorScaleY,
++        Desc.JitterOffsetX,
++        Desc.JitterOffsetY,
++        Desc.PreExposure,
++    };
++
++    allocator_->InvalidateCurrentPass();
++    auto motion_vector_view = View2D(motion_vector, motion_vector_format);
++
++    // MetalFX wants motion vectors at render size; shrink display-size ones first, applying their scale.
++    if (scaler.motion_vector_lowres) {
++      auto pso = device_->GetMotionVectorDownscalePipeline();
++      if (!pso)
++        return FALSE;
++      auto lowres_view = View2D(scaler.motion_vector_lowres, motion_vector_format);
++
++      auto compute = allocator_->AllocatePass<ComputeEncoderData>();
++      compute->type = EncoderType::Compute;
++      compute->cmd_head.type = WMTComputeCommandNop;
++      compute->cmd_head.next.set(0);
++      compute->cmd_tail = (wmtcmd_base *)&compute->cmd_head;
++
++      auto &setpso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
++      setpso.type = WMTComputeCommandSetPSO;
++      setpso.pso = pso;
++      setpso.threadgroup_size = {8, 4, 1};
++
++      auto &set_source = allocator_->EncodeComputeCommand<wmtcmd_compute_settexture>();
++      set_source.type = WMTComputeCommandSetTexture;
++      set_source.texture = motion_vector_view.texture();
++      set_source.index = 0;
++
++      auto &set_target = allocator_->EncodeComputeCommand<wmtcmd_compute_settexture>();
++      set_target.type = WMTComputeCommandSetTexture;
++      set_target.texture = lowres_view.texture();
++      set_target.index = 1;
++
++      auto scale = allocator_->AllocateCommandData<float>(2);
++      scale[0] = props.motion_vector_scale_x;
++      scale[1] = props.motion_vector_scale_y;
++      auto &set_scale = allocator_->EncodeComputeCommand<wmtcmd_compute_setbytes>();
++      set_scale.type = WMTComputeCommandSetBytes;
++      set_scale.bytes.set(scale);
++      set_scale.length = sizeof(float) * 2;
++      set_scale.index = 0;
++
++      auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
++      dispatch.type = WMTComputeCommandDispatchThreads;
++      dispatch.size = {info.input_width, info.input_height, 1};
++
++      allocator_->InvalidateCurrentPass();
++      motion_vector_view = lowres_view;
++      props.motion_vector_scale_x = 1.0f;
++      props.motion_vector_scale_y = 1.0f;
++    }
++
++    auto upscale = allocator_->AllocatePass<TemporalUpscaleEncoderData>();
++    upscale->type = EncoderType::TemporalUpscale;
++    upscale->input = View2D(input, input->pixelFormat());
++    upscale->output = View2D(output, output->pixelFormat());
++    upscale->depth = View2D(depth, depth->pixelFormat());
++    upscale->motion_vector = motion_vector_view;
++    if (exposure)
++      upscale->exposure = View2D(exposure, exposure->pixelFormat());
++    upscale->scaler = scaler.scaler;
++    upscale->props = props;
++    allocator_->InvalidateCurrentPass();
++    return TRUE;
++  }
++
+ public:
+   MTLD3D12GraphicsCommandListImpl(MTLD3D12Device *pDevice) : MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList>(pDevice) {}
+ 
+@@ -227,6 +415,11 @@ public:
+       return S_OK;
+     }
+ 
++    if (riid == __uuidof(IMTLD3D12CommandListExt)) {
++      *ppvObject = ref(&ext_);
++      return S_OK;
++    }
++
+     if (logQueryInterfaceError(__uuidof(ID3D12GraphicsCommandList), riid)) {
+       WARN("D3D12GraphicsCommandList: Unknown interface query ", str::format(riid));
+     }
+diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
+index 57b0332..981ecdb 100644
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -338,6 +338,29 @@ public:
+ 
+           break;
+         }
++        case EncoderType::TemporalUpscale: {
++          // MetalFX encodes its own passes; hand the queue's ordering to the scaler's fence and back.
++          auto data = static_cast<TemporalUpscaleEncoderData *>(current);
++          auto scaler_fence = data->scaler->fence();
++
++          auto begin = cmdbuf.blitCommandEncoder();
++          begin.setLabel(WMT::String::string("BeginScaler", WMTUTF8StringEncoding));
++          begin.waitForFence(fence_);
++          begin.updateFence(scaler_fence);
++          begin.endEncoding();
++
++          cmdbuf.encodeTemporalScale(
++              data->scaler->scaler(), data->input.texture(), data->output.texture(), data->depth.texture(),
++              data->motion_vector.texture(), data->exposure.texture(), scaler_fence, data->props
++          );
++
++          auto end = cmdbuf.blitCommandEncoder();
++          end.setLabel(WMT::String::string("EndScaler", WMTUTF8StringEncoding));
++          end.waitForFence(scaler_fence);
++          end.updateFence(fence_);
++          end.endEncoding();
++          break;
++        }
+         }
+         current = current->next;
+       }
+diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
+index 1a5246a..877986d 100644
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -47,6 +47,14 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device>> {
+   InternalCommandLibrary command_library;
+   FormatCapabilityInspector format_inspector_;
+ 
++  struct CachedTemporalScaler {
++    WMTFXTemporalScalerInfo info;
++    TemporalScalerEntry entry;
++  };
++  dxmt::mutex scaler_lock_;
++  std::vector<CachedTemporalScaler> scaler_cache_;
++  WMT::Reference<WMT::ComputePipelineState> mv_downscale_pso_;
++
+ public:
+   MTLD3D12DeviceImpl(IMTLDXGIAdapter *adapter) : adapter_(adapter), command_library(adapter_->GetMTLDevice()) {}
+ 
+@@ -1266,6 +1274,56 @@ public:
+     return command_library;
+   }
+ 
++  TemporalScalerEntry
++  GetTemporalScaler(const WMTFXTemporalScalerInfo &Info, bool MotionVectorInDisplayRes) {
++    std::lock_guard<dxmt::mutex> lock(scaler_lock_);
++    for (auto &cached : scaler_cache_) {
++      auto &i = cached.info;
++      if (i.color_format == Info.color_format && i.output_format == Info.output_format &&
++          i.depth_format == Info.depth_format && i.motion_format == Info.motion_format &&
++          i.input_width == Info.input_width && i.input_height == Info.input_height &&
++          i.output_width == Info.output_width && i.output_height == Info.output_height &&
++          i.auto_exposure == Info.auto_exposure &&
++          MotionVectorInDisplayRes == (cached.entry.motion_vector_lowres != nullptr))
++        return cached.entry;
++    }
++
++    CachedTemporalScaler cached{Info, {new TemporalScaler(GetMTLDevice(), Info), nullptr}};
++    if (MotionVectorInDisplayRes) {
++      WMTTextureInfo tex_info{};
++      tex_info.width = Info.input_width;
++      tex_info.height = Info.input_height;
++      tex_info.depth = 1;
++      tex_info.array_length = 1;
++      tex_info.mipmap_level_count = 1;
++      tex_info.pixel_format = Info.motion_format;
++      tex_info.sample_count = 1;
++      tex_info.type = WMTTextureType2D;
++      tex_info.usage = WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
++      tex_info.options = WMTResourceStorageModePrivate;
++      auto texture = Rc<Texture>(new Texture(tex_info, GetMTLDevice()));
++      Flags<TextureAllocationFlag> flags;
++      flags.set(TextureAllocationFlag::GpuPrivate);
++      texture->rename(texture->allocate(flags));
++      cached.entry.motion_vector_lowres = std::move(texture);
++    }
++    scaler_cache_.push_back(cached);
++    return cached.entry;
++  }
++
++  WMT::ComputePipelineState
++  GetMotionVectorDownscalePipeline() {
++    std::lock_guard<dxmt::mutex> lock(scaler_lock_);
++    if (!mv_downscale_pso_) {
++      WMT::Reference<WMT::Error> err;
++      auto function = command_library.getLibrary().newFunction("cs_downscale_dilated_mv");
++      mv_downscale_pso_ = GetMTLDevice().newComputePipelineState(function, err);
++      if (!mv_downscale_pso_)
++        ERR("Failed to create the motion vector downscale pipeline: ", err.description().getUTF8String());
++    }
++    return mv_downscale_pso_;
++  }
++
+   virtual FormatCapability
+   GetMTLPixelFormatCapability(WMTPixelFormat Format) final {
+     Format = ORIGINAL_FORMAT(Format);
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index bbe91ed..3af4bb4 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -186,6 +186,17 @@ public:
+ 
+   virtual FormatCapability GetMTLPixelFormatCapability(WMTPixelFormat Format) = 0;
+ 
++  // MetalFX temporal scalers are costly to create, so they're kept per configuration for the device's
++  // lifetime. motion_vector_lowres is a render-size target for display-size motion vectors (null otherwise).
++  struct TemporalScalerEntry {
++    Rc<TemporalScaler> scaler;
++    Rc<Texture> motion_vector_lowres;
++  };
++  virtual TemporalScalerEntry GetTemporalScaler(const WMTFXTemporalScalerInfo &Info, bool MotionVectorInDisplayRes) = 0;
++
++  // Compute pipeline that turns display-size motion vectors into render-size ones (cs_downscale_dilated_mv).
++  virtual WMT::ComputePipelineState GetMotionVectorDownscalePipeline() = 0;
++
+   EventListener event_listener;
+ 
+   WMT::Reference<WMT::DepthStencilState> default_depth_stencil_state;
+diff --git a/src/d3d12/d3d12_interfaces.hpp b/src/d3d12/d3d12_interfaces.hpp
+new file mode 100644
+index 0000000..a1f8a03
+--- /dev/null
++++ b/src/d3d12/d3d12_interfaces.hpp
+@@ -0,0 +1,35 @@
++#pragma once
++#include "com/com_guid.hpp"
++#include "d3d12.h"
++
++/* D3D12 counterpart of MTL_TEMPORAL_UPSCALE_D3D11_DESC: one MetalFX temporal upscale, recorded into a command list. */
++struct MTL_TEMPORAL_UPSCALE_D3D12_DESC {
++  UINT InputContentWidth;  // can be 0, which means full width
++  UINT InputContentHeight; // can be 0, which means full height
++  BOOL AutoExposure;
++  BOOL InReset;
++  BOOL DepthReversed;
++  BOOL MotionVectorInDisplayRes;
++  ID3D12Resource *Color;
++  ID3D12Resource *Depth;
++  ID3D12Resource *MotionVector;
++  ID3D12Resource *Output;
++  FLOAT MotionVectorScaleX;
++  FLOAT MotionVectorScaleY;
++  FLOAT PreExposure;
++  ID3D12Resource *ExposureTexture;
++  FLOAT JitterOffsetX;
++  FLOAT JitterOffsetY;
++};
++
++typedef enum MTL_D3D12_FEATURE {
++  MTL_D3D12_FEATURE_METALFX_TEMPORAL_SCALER = 0,
++} MTL_D3D12_FEATURE;
++
++DEFINE_COM_INTERFACE("cd2dfaa3-e62d-4181-b333-27528b438fc5", IMTLD3D12CommandListExt) : public IUnknown {
++  // Returns FALSE when nothing was recorded (missing or unsupported resources).
++  virtual BOOL STDMETHODCALLTYPE TemporalUpscale(const MTL_TEMPORAL_UPSCALE_D3D12_DESC *pDesc) = 0;
++  virtual HRESULT STDMETHODCALLTYPE CheckFeatureSupport(
++      MTL_D3D12_FEATURE Feature, void *pFeatureSupportData, UINT FeatureSupportDataSize
++  ) = 0;
++};
+diff --git a/src/nvngx/meson.build b/src/nvngx/meson.build
+index b94ad4b..7d1ccf1 100644
+--- a/src/nvngx/meson.build
++++ b/src/nvngx/meson.build
+@@ -1,5 +1,6 @@
+ nvngx_src = [
+   'nvngx.cpp',
++  'nvngx_d3d12.cpp',
+ ]
+ 
+ nvngx_ld_args      = []
+diff --git a/src/nvngx/nvngx_d3d12.cpp b/src/nvngx/nvngx_d3d12.cpp
+new file mode 100644
+index 0000000..a05da75
+--- /dev/null
++++ b/src/nvngx/nvngx_d3d12.cpp
+@@ -0,0 +1,211 @@
++/*
++ * NGX for D3D12: DLSS Super Resolution served by MetalFX's temporal scaler, recorded into the game's
++ * command list. Everything that doesn't touch the device (parameters, capabilities, feature handles)
++ * behaves as the D3D11 entry points do.
++ */
++
++#include "com/com_pointer.hpp"
++#include "d3d12.h"
++#include "nvngx.hpp"
++#include "log/log.hpp"
++#include "nvngx_feature.hpp"
++#include "nvngx_parameter.hpp"
++#include "../d3d12/d3d12_interfaces.hpp"
++
++namespace dxmt {
++
++NVNGX_API NVNGX_RESULT NVSDK_NGX_D3D11_GetCapabilityParameters(NVNGXParameter **out_params);
++NVNGX_API NVNGX_RESULT NVSDK_NGX_D3D11_AllocateParameters(NVNGXParameter **out_params);
++NVNGX_API NVNGX_RESULT NVSDK_NGX_D3D11_DestroyParameters(NVNGXParameter *params);
++NVNGX_API NVNGX_RESULT NVSDK_NGX_D3D11_ReleaseFeature(unsigned int *handle);
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D11_GetFeatureRequirements(
++    IDXGIAdapter *adapter, const NVNGX_FeatureDiscoveryInfo *discovery_info, NVNGX_FeatureRequirement *requirement
++);
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Init_Ext(
++    unsigned long long id, const wchar_t *path, ID3D12Device *device, unsigned int sdk_version, const void *feature_info
++) {
++  return NVNGX_RESULT_OK;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Init(
++    unsigned long long id, const wchar_t *path, ID3D12Device *device, const void *feature_info, unsigned int sdk_version
++) {
++  return NVNGX_RESULT_OK;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Init_ProjectID(
++    const char *project, unsigned int engine_type, const char *engine_version, const wchar_t *path,
++    ID3D12Device *device, unsigned int sdk_version, const void *feature_info
++) {
++  return NVNGX_RESULT_OK;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Init_with_ProjectID(
++    const char *project, unsigned int engine_type, const char *engine_version, const wchar_t *path,
++    ID3D12Device *device, const void *feature_info, unsigned int sdk_version
++) {
++  return NVNGX_RESULT_OK;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Shutdown() {
++  return NVNGX_RESULT_OK;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Shutdown1(ID3D12Device *device) {
++  return NVNGX_RESULT_OK;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_GetCapabilityParameters(NVNGXParameter **out_params) {
++  return NVSDK_NGX_D3D11_GetCapabilityParameters(out_params);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_GetParameters(NVNGXParameter **out_params) {
++  return NVSDK_NGX_D3D11_GetCapabilityParameters(out_params);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_AllocateParameters(NVNGXParameter **out_params) {
++  return NVSDK_NGX_D3D11_AllocateParameters(out_params);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_DestroyParameters(NVNGXParameter *params) {
++  return NVSDK_NGX_D3D11_DestroyParameters(params);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_GetScratchBufferSize(unsigned int feature, const NVNGXParameter *params, size_t *out_size) {
++  if (out_size)
++    *out_size = 0;
++  return NVNGX_RESULT_OK;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_GetFeatureRequirements(
++    IDXGIAdapter *adapter, const NVNGX_FeatureDiscoveryInfo *discovery_info, NVNGX_FeatureRequirement *requirement
++) {
++  return NVSDK_NGX_D3D11_GetFeatureRequirements(adapter, discovery_info, requirement);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_ReleaseFeature(unsigned int *handle) {
++  return NVSDK_NGX_D3D11_ReleaseFeature(handle);
++}
++
++static Com<IMTLD3D12CommandListExt>
++GetCommandListExt(ID3D12GraphicsCommandList *command_list) {
++  Com<IMTLD3D12CommandListExt> ext;
++  if (!command_list || FAILED(command_list->QueryInterface(IID_PPV_ARGS(&ext))))
++    return nullptr;
++  return ext;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_CreateFeature(
++    ID3D12GraphicsCommandList *command_list, unsigned int feature, NVNGXParameter *params, unsigned int **out_handle
++) {
++  auto parameters = static_cast<ParametersImpl *>(params);
++  auto ext = GetCommandListExt(command_list);
++  if (!ext || !parameters || !out_handle)
++    return NVNGX_RESULT_INVALID_PARAMETER;
++
++  if (feature != NVNGX_FEATURE_SUPERSAMPLING) {
++    ERR("NVSDK_NGX_D3D12_CreateFeature: feature ", feature, " not handled");
++    return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
++  }
++
++  BOOL supported = false;
++  if (FAILED(ext->CheckFeatureSupport(MTL_D3D12_FEATURE_METALFX_TEMPORAL_SCALER, &supported, sizeof(supported))) ||
++      !supported)
++    return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
++
++  auto dlss = std::make_unique<DLSSFeature>();
++  dlss->feature = NVNGX_FEATURE_SUPERSAMPLING;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Width, &dlss->width)) ||
++      NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Height, &dlss->height)) ||
++      NVNGX_FAILED(parameters->Get(NVNGX_Parameter_OutWidth, &dlss->target_width)) ||
++      NVNGX_FAILED(parameters->Get(NVNGX_Parameter_OutHeight, &dlss->target_height)))
++    return NVNGX_RESULT_INVALID_PARAMETER;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_PerfQualityValue, &dlss->quality)))
++    dlss->quality = 0;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_DLSS_Feature_Create_Flags, &dlss->flag)))
++    dlss->flag = 0;
++  if (NVNGX_FAILED(parameters->Get("DLSS.Enable.Output.Subrects", &dlss->enable_output_subrects)))
++    dlss->enable_output_subrects = 0;
++
++  *out_handle = &dlss.release()->handle;
++  return NVNGX_RESULT_OK;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_EvaluateFeature(
++    ID3D12GraphicsCommandList *command_list, const unsigned int *handle, NVNGXParameter *params, void *callback
++) {
++  auto parameters = static_cast<ParametersImpl *>(params);
++  if (!handle || !parameters)
++    return NVNGX_RESULT_INVALID_PARAMETER;
++  if (static_cast<const CommonFeature *>((const void *)handle)->feature != NVNGX_FEATURE_SUPERSAMPLING)
++    return NVNGX_RESULT_FAIL;
++  auto dlss = static_cast<const DLSSFeature *>((const void *)handle);
++
++  auto ext = GetCommandListExt(command_list);
++  if (!ext)
++    return NVNGX_RESULT_INVALID_PARAMETER;
++
++  MTL_TEMPORAL_UPSCALE_D3D12_DESC desc = {};
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Color, &desc.Color)) ||
++      NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Output, &desc.Output)) ||
++      NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Depth, &desc.Depth)) ||
++      NVNGX_FAILED(parameters->Get(NVNGX_Parameter_MotionVectors, &desc.MotionVector)))
++    return NVNGX_RESULT_INVALID_PARAMETER;
++  parameters->Get(NVNGX_Parameter_ExposureTexture, &desc.ExposureTexture);
++
++  // The render size can change every frame (dynamic resolution); without a subrect it's the whole input.
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &desc.InputContentWidth)))
++    desc.InputContentWidth = 0;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &desc.InputContentHeight)))
++    desc.InputContentHeight = 0;
++
++  desc.DepthReversed = bool(dlss->flag & NVNGX_DLSS_FLAG_DEPTH_INVERTED);
++  desc.AutoExposure = bool(dlss->flag & NVNGX_DLSS_FLAG_AUTO_EXPOSURE);
++  desc.MotionVectorInDisplayRes = !bool(dlss->flag & NVNGX_DLSS_FLAG_MV_LOWRES);
++
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Jitter_Offset_X, &desc.JitterOffsetX)))
++    desc.JitterOffsetX = 0;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Jitter_Offset_Y, &desc.JitterOffsetY)))
++    desc.JitterOffsetY = 0;
++
++  int reset = 0;
++  parameters->Get(NVNGX_Parameter_Reset, &reset);
++  desc.InReset = reset;
++
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_MV_Scale_X, &desc.MotionVectorScaleX)))
++    desc.MotionVectorScaleX = 1.0;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_MV_Scale_Y, &desc.MotionVectorScaleY)))
++    desc.MotionVectorScaleY = 1.0;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_DLSS_Pre_Exposure, &desc.PreExposure)))
++    desc.PreExposure = 1.0;
++
++  if (!ext->TemporalUpscale(&desc))
++    return NVNGX_RESULT_FAIL;
++  return NVNGX_RESULT_OK;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_EvaluateFeature_C(
++    ID3D12GraphicsCommandList *command_list, const unsigned int *handle, NVNGXParameter *params, void *callback
++) {
++  return NVSDK_NGX_D3D12_EvaluateFeature(command_list, handle, params, callback);
++}
++
++} // namespace dxmt
+-- 
+2.50.1 (Apple Git-155)
+

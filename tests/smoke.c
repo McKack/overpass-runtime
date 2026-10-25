@@ -185,7 +185,7 @@ int main(void)
     FARPROC ngx11 = m ? GetProcAddress(m, "NVSDK_NGX_D3D11_Init") : NULL;
     FARPROC ngx12 = m ? GetProcAddress(m, "NVSDK_NGX_D3D12_Init") : NULL;
     CHECK(ngx11 != NULL, "nvngx: NVSDK_NGX_D3D11_Init %s", ngx11 ? "found" : "missing");
-    printf("info nvngx: NVSDK_NGX_D3D12_Init %s\n", ngx12 ? "found" : "missing");
+    CHECK(ngx12 != NULL, "nvngx: NVSDK_NGX_D3D12_Init %s", ngx12 ? "found" : "missing");
 
     printf("%d failure(s)\n", failures);
     return failures;
