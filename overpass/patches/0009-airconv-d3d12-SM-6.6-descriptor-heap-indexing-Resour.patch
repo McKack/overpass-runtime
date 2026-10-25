@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:53:38 +0100
+Subject: [PATCH] airconv, d3d12: SM 6.6 descriptor heap indexing
+ (ResourceDescriptorHeap, SamplerDescriptorHeap)
+
+Root signatures with CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED or
+SAMPLER_HEAP_DIRECTLY_INDEXED get two more root argument qwords, the base
+addresses of the heaps bound with SetDescriptorHeaps. In shaders, each distinct
+heap resource type (from annotateHandle's resource properties) becomes a
+synthetic range at register 0 bound to those addresses, so the heap index is
+the register index and the existing descriptor loads apply unchanged.
+---
+ src/airconv/dxbc_binding_rootsig.cpp   | 33 +++++++++++
+ src/airconv/dxil_converter.cpp         | 76 +++++++++++++++++++++++++-
+ src/airconv/dxil_metadata.hpp          | 39 +++++++++++++
+ src/airconv/nt/dxil_converter_base.cpp | 24 ++++++++
+ src/airconv/nt/dxil_converter_base.hpp |  1 +
+ src/d3d12/d3d12_command_list.cpp       | 35 +++++++++++-
+ src/d3d12/d3d12_device.hpp             |  3 +
+ src/d3d12/d3d12_root_signature.cpp     |  5 ++
+ 8 files changed, 214 insertions(+), 2 deletions(-)
+
+diff --git a/src/airconv/dxbc_binding_rootsig.cpp b/src/airconv/dxbc_binding_rootsig.cpp
+index ad93df1..b506c3d 100644
+--- a/src/airconv/dxbc_binding_rootsig.cpp
++++ b/src/airconv/dxbc_binding_rootsig.cpp
+@@ -562,6 +562,39 @@ setup_binding_rootsig(
+     }
+   }
+ 
++  // ResourceDescriptorHeap / SamplerDescriptorHeap (SM 6.6): both heaps' base addresses follow the parameters,
++  // and heap resources (their synthetic ranges) index them from 0.
++  constexpr uint32_t kHeapsDirectlyIndexed = 0x400 /* CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED */ |
++                                            0x800 /* SAMPLER_HEAP_DIRECTLY_INDEXED */;
++  if (root_sig.Flags & kHeapsDirectlyIndexed) {
++    auto resource_heap = builder.DefineBuffer(
++        "resource_heap", AddressSpace::constant, MemoryAccess::read, msl_int, inc_attribute_index++
++    );
++    auto sampler_heap = builder.DefineBuffer(
++        "sampler_heap", AddressSpace::constant, MemoryAccess::read, msl_int, inc_attribute_index++
++    );
++    for (auto &[id, srv] : shader_info->srvMap)
++      if (srv.range.space == dxil::kHeapSpace) {
++        binding_map->SRVs[id] = {srv, 0};
++        binding_map->SRVs[id].first.arg_index = resource_heap;
++      }
++    for (auto &[id, uav] : shader_info->uavMap)
++      if (uav.range.space == dxil::kHeapSpace) {
++        binding_map->UAVs[id] = {uav, 0};
++        binding_map->UAVs[id].first.arg_index = resource_heap;
++      }
++    for (auto &[id, cbuf] : shader_info->cbufferMap)
++      if (cbuf.range.space == dxil::kHeapSpace) {
++        binding_map->ConstantBuffers[id] = {cbuf, 0};
++        binding_map->ConstantBuffers[id].first.arg_index = resource_heap;
++      }
++    for (auto &[id, sampler] : shader_info->samplerMap)
++      if (sampler.range.space == dxil::kHeapSpace) {
++        binding_map->Samplers[id] = {sampler, 0};
++        binding_map->Samplers[id].first.arg_index = sampler_heap;
++      }
++  }
++
+   auto [type, metadata] = builder.Build(module.getContext(), module.getDataLayout());
+ 
+   binding_map->RootSignatureArgumentIndex = func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
+diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
+index a99b46f..17e98e6 100644
+--- a/src/airconv/dxil_converter.cpp
++++ b/src/airconv/dxil_converter.cpp
+@@ -78,6 +78,24 @@ to_shader_resource_type(ResourceKind kind) {
+ // defined in `nt/dxil_converter_base.hpp`
+ std::optional<uint32_t> asU32(llvm::Value *value);
+ 
++// annotateHandle(createHandleFromHeap(index, sampler heap, non-uniform), properties): the heap resource it names.
++std::optional<HeapResource>
++heap_resource_of(const CallInst *annotate) {
++  auto *inner = dyn_cast<CallInst>(annotate->getArgOperand(1));
++  if (!inner || !inner->getCalledFunction() || inner->getCalledFunction()->getName() != "dx.op.createHandleFromHeap")
++    return std::nullopt;
++  auto *sampler_heap = dyn_cast<ConstantInt>(inner->getArgOperand(2));
++  auto *props = dyn_cast<Constant>(annotate->getArgOperand(2));
++  if (!sampler_heap || !props)
++    return std::nullopt;
++  auto dword = [&](unsigned i) -> uint32_t {
++    auto *v = props->getAggregateElement(i);
++    auto value = v ? asU32(v) : std::nullopt;
++    return value ? *value : 0;
++  };
++  return decode_heap_resource(!sampler_heap->isZero(), dword(0), dword(1));
++}
++
+ // SM 6.6 handles: the range a %dx.types.ResBind {lower bound, upper bound, space, class} constant names.
+ llvm::Expected<std::pair<uint8_t, uint32_t>>
+ resolve_binding(const llvm::Value *binding, const EntryPoint &entry) {
+@@ -113,8 +131,11 @@ resolve_handle(const llvm::Value *handle, const EntryPoint &entry) {
+       }
+       if (name == "dx.op.createHandleFromBinding")
+         return resolve_binding(ci->getArgOperand(1), entry);
+-      if (name == "dx.op.annotateHandle")
++      if (name == "dx.op.annotateHandle") {
++        if (auto heap = heap_resource_of(ci))
++          return std::make_pair((uint8_t)heap->resource_class, heap->id);
+         return resolve_handle(ci->getArgOperand(1), entry);
++      }
+       return unsupported("dxil: unsupported resource handle operation " + name.str());
+     }
+   }
+@@ -669,6 +690,59 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
+     }
+   }
+ 
++  // Heap resources: one synthetic range per distinct type, bound to the descriptor heap by the root signature.
++  for (auto &bb : *entry.function) {
++    for (auto &inst : bb) {
++      auto *ci = dyn_cast<CallInst>(&inst);
++      if (!ci || !ci->getCalledFunction() || ci->getCalledFunction()->getName() != "dx.op.annotateHandle")
++        continue;
++      auto heap = heap_resource_of(ci);
++      if (!heap)
++        continue;
++      dxbc::ResourceRange range{heap->id, 0, ~0u, kHeapSpace};
++      auto scaler = heap->kind == ResourceKind::StructuredBuffer || heap->kind == ResourceKind::RawBuffer
++                        ? std::optional(dxmt::shader::common::ScalerDataType::Uint)
++                        : to_shader_scaler((ComponentType)heap->element);
++      switch (heap->resource_class) {
++      case ResourceClass::Sampler:
++        shader_info.samplerMap.try_emplace(heap->id, dxbc::SamplerInfo{range});
++        break;
++      case ResourceClass::CBV: {
++        dxbc::ConstantBufferInfo cbuffer{};
++        cbuffer.range = range;
++        cbuffer.size_in_vec4 = 4096; // up to 64 KB
++        shader_info.cbufferMap.try_emplace(heap->id, cbuffer);
++        break;
++      }
++      case ResourceClass::SRV: {
++        auto type = to_shader_resource_type(heap->kind);
++        if (!type || !scaler)
++          return unsupported("dxil: unsupported descriptor heap resource");
++        dxbc::ShaderResourceViewInfo srv{};
++        srv.range = range;
++        srv.scaler_type = *scaler;
++        srv.resource_type = *type;
++        srv.structure_stride = heap->kind == ResourceKind::StructuredBuffer ? heap->element : 0;
++        shader_info.srvMap.try_emplace(heap->id, srv);
++        break;
++      }
++      case ResourceClass::UAV: {
++        auto type = to_shader_resource_type(heap->kind);
++        if (!type || !scaler)
++          return unsupported("dxil: unsupported descriptor heap resource");
++        dxbc::UnorderedAccessViewInfo uav{};
++        uav.range = range;
++        uav.scaler_type = *scaler;
++        uav.resource_type = *type;
++        uav.global_coherent = heap->globally_coherent;
++        uav.structure_stride = heap->kind == ResourceKind::StructuredBuffer ? heap->element : 0;
++        shader_info.uavMap.try_emplace(heap->id, uav);
++        break;
++      }
++      }
++    }
++  }
++
+   for (auto &bb : *entry.function) {
+     for (auto &inst : bb) {
+       auto *ci = dyn_cast<CallInst>(&inst);
+diff --git a/src/airconv/dxil_metadata.hpp b/src/airconv/dxil_metadata.hpp
+index fd48e1b..604c607 100644
+--- a/src/airconv/dxil_metadata.hpp
++++ b/src/airconv/dxil_metadata.hpp
+@@ -64,6 +64,45 @@ enum class ResourceClass : uint8_t {
+   Sampler = 3,
+ };
+ 
++// Resources reached through ResourceDescriptorHeap / SamplerDescriptorHeap (SM 6.6) get synthetic ranges in
++// this space, one per distinct resource type, at register 0, so their register index is the heap index.
++constexpr uint32_t kHeapSpace = 0xfffffff0;
++
++struct HeapResource {
++  ResourceClass resource_class;
++  ResourceKind kind;
++  uint32_t element; // component type, structure stride, or (samplers) 1 for comparison
++  bool globally_coherent;
++  uint32_t id;      // synthetic range id, the same in every pass
++};
++
++// From annotateHandle's %dx.types.ResourceProperties {dword0, dword1}: byte 0 of dword0 is the resource kind;
++// bit 12 is UAV, 14 globally coherent, 15 comparison sampler (or structured buffer counter). dword1 is the
++// component type (low byte) for typed resources and the stride for structured buffers.
++inline HeapResource
++decode_heap_resource(bool sampler_heap, uint32_t dword0, uint32_t dword1) {
++  HeapResource r{};
++  r.kind = ResourceKind(dword0 & 0xff);
++  r.globally_coherent = dword0 & (1u << 14);
++  if (sampler_heap)
++    r.resource_class = ResourceClass::Sampler;
++  else if (r.kind == ResourceKind::CBuffer)
++    r.resource_class = ResourceClass::CBV;
++  else
++    r.resource_class = (dword0 & (1u << 12)) ? ResourceClass::UAV : ResourceClass::SRV;
++  if (r.resource_class == ResourceClass::Sampler)
++    r.element = (dword0 >> 15) & 1;
++  else if (r.resource_class == ResourceClass::CBV || r.kind == ResourceKind::RawBuffer)
++    r.element = 0;
++  else if (r.kind == ResourceKind::StructuredBuffer)
++    r.element = dword1;
++  else
++    r.element = dword1 & 0xff;
++  r.id = 0xc0000000u | (uint32_t(r.resource_class) << 28) | ((uint32_t(r.kind) & 0x1f) << 23) |
++         (uint32_t(r.globally_coherent) << 22) | (r.element & 0x3fffff);
++  return r;
++}
++
+ enum class ResourceTag : uint32_t {
+   TypedBufferElementType = 0,
+   StructuredBufferElementStride = 1,
+diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
+index 6a8eb4f..0722000 100644
+--- a/src/airconv/nt/dxil_converter_base.cpp
++++ b/src/airconv/nt/dxil_converter_base.cpp
+@@ -791,6 +791,13 @@ Converter::EmitDxilOp(CallInst &Call) {
+     return EmitCreateHandleFromBinding(Call);
+   if (op == "annotateHandle")
+     return EmitAnnotateHandle(Call);
++  if (op == "createHandleFromHeap") {
++    auto Index = Get(Call.getArgOperand(1));
++    if (!Index)
++      return Index.takeError();
++    heap_indices_[&Call] = *Index;
++    return (llvm::Value *)nullptr;
++  }
+   if (op == "cbufferLoadLegacy")
+     return EmitCbufferLoadLegacy(Call);
+   if (op == "threadId")
+@@ -934,6 +941,23 @@ Converter::EmitCreateHandleFromBinding(CallInst &Call) {
+ // SM 6.6: annotateHandle(handle, %dx.types.ResourceProperties) describes a handle; it is the same resource.
+ llvm::Expected<llvm::Value *>
+ Converter::EmitAnnotateHandle(CallInst &Call) {
++  // A descriptor heap handle: its synthetic range (see decode_heap_resource), indexed by the heap index.
++  auto HeapIndex = heap_indices_.find(Call.getArgOperand(1));
++  if (HeapIndex != heap_indices_.end()) {
++    auto *Inner = cast<CallInst>(Call.getArgOperand(1));
++    auto *SamplerHeap = dyn_cast<ConstantInt>(Inner->getArgOperand(2));
++    auto *Props = dyn_cast<Constant>(Call.getArgOperand(2));
++    if (!SamplerHeap || !Props)
++      return unsupported("dxil: non-constant descriptor heap handle properties");
++    auto Dword = [&](unsigned i) -> uint32_t {
++      auto *V = Props->getAggregateElement(i);
++      auto Value = V ? asU32(V) : std::nullopt;
++      return Value ? *Value : 0;
++    };
++    auto Heap = decode_heap_resource(!SamplerHeap->isZero(), Dword(0), Dword(1));
++    handles_[&Call] = HandleInfo{Heap.resource_class, Heap.id, HeapIndex->second};
++    return (llvm::Value *)nullptr;
++  }
+   auto Handle = ResolveHandleOperand(Call.getArgOperand(1));
+   if (!Handle)
+     return Handle.takeError();
+diff --git a/src/airconv/nt/dxil_converter_base.hpp b/src/airconv/nt/dxil_converter_base.hpp
+index 67a0148..ca13f52 100644
+--- a/src/airconv/nt/dxil_converter_base.hpp
++++ b/src/airconv/nt/dxil_converter_base.hpp
+@@ -47,6 +47,7 @@ private:
+   llvm::DenseMap<llvm::Constant *, llvm::Constant *> constant_map_;
+   llvm::DenseMap<llvm::GlobalVariable *, llvm::GlobalVariable *> global_map_;
+   llvm::DenseMap<const llvm::Value *, HandleInfo> handles_;
++  llvm::DenseMap<const llvm::Value *, llvm::Value *> heap_indices_; // createHandleFromHeap -> heap index
+ 
+   llvm::Type *MapType(llvm::Type *Type);
+   llvm::Expected<llvm::Constant *> MapConstantExpr(llvm::ConstantExpr *Expr);
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index 7b370b6..490b794 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -150,6 +150,22 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
+   FLOAT blend_factor_[4];
+   UINT8 stencil_ref_;
+ 
++  // Shader-visible heaps from SetDescriptorHeaps: [0] CBV/SRV/UAV, [1] sampler. Root signatures that index heaps
++  // directly get these addresses in their root arguments.
++  uint64_t heap_addresses_[2] = {};
++
++  void
++  StageHeapAddresses() {
++    if (rootsig_graphics_ && rootsig_graphics_->HeapQwordOffset != ~0u) {
++      memcpy(&rootarg_graphics_staging_[rootsig_graphics_->HeapQwordOffset], heap_addresses_, sizeof(heap_addresses_));
++      dirty_state_.set(DirtyState::GraphicsRootArguments);
++    }
++    if (rootsig_compute_ && rootsig_compute_->HeapQwordOffset != ~0u) {
++      memcpy(&rootarg_compute_staging_[rootsig_compute_->HeapQwordOffset], heap_addresses_, sizeof(heap_addresses_));
++      dirty_state_.set(DirtyState::ComputeRootArguments);
++    }
++  }
++
+   // IMTLD3D12CommandListExt, used by nvngx for DLSS -> MetalFX.
+   class CommandListExt final : public IMTLD3D12CommandListExt {
+     MTLD3D12GraphicsCommandListImpl *list_;
+@@ -379,6 +395,8 @@ public:
+ 
+     memset(vertex_buffers_.data(), 0, sizeof(vertex_buffers_));
+ 
++    memset(heap_addresses_, 0, sizeof(heap_addresses_));
++
+     index_buffer_address = 0;
+     index_buffer = {};
+     index_type = {};
+@@ -1221,7 +1239,20 @@ public:
+   void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *CommandList) { IMPLEMENT_ME };
+ 
+   void STDMETHODCALLTYPE SetDescriptorHeaps(UINT HeapCount, ID3D12DescriptorHeap *const *Heaps) {
+-    // no need to do anything here because because we encode the full descriptor table address in root argument
++    // Descriptor tables carry full addresses already; only directly indexed heaps (SM 6.6) need the heaps.
++    for (UINT i = 0; i < HeapCount; i++) {
++      if (!Heaps[i])
++        continue;
++      D3D12_DESCRIPTOR_HEAP_DESC desc;
++      Heaps[i]->GetDesc(&desc);
++      D3D12_GPU_DESCRIPTOR_HANDLE start;
++      Heaps[i]->GetGPUDescriptorHandleForHeapStart(&start);
++      if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
++        heap_addresses_[0] = start.ptr;
++      else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
++        heap_addresses_[1] = start.ptr;
++    }
++    StageHeapAddresses();
+   };
+ 
+   void STDMETHODCALLTYPE
+@@ -1234,6 +1265,7 @@ public:
+     } else {
+       rootsig_compute_ = nullptr;
+     }
++    StageHeapAddresses();
+     dirty_state_.set(DirtyState::ComputeRootArguments, DirtyState::ComputeRootSignature);
+   };
+ 
+@@ -1247,6 +1279,7 @@ public:
+     } else {
+       rootsig_graphics_ = nullptr;
+     }
++    StageHeapAddresses();
+     dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
+   };
+ 
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index a7b63d8..a8e93e2 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -106,6 +106,9 @@ public:
+   uint32_t UploadQwords;
+   uint32_t ParameterSlots;
+   uint32_t const *SlotQwordOffsets;
++  // With CBV_SRV_UAV/SAMPLER_HEAP_DIRECTLY_INDEXED: the resource and sampler heaps' base addresses go in the two
++  // qwords from here (after the parameters). ~0u otherwise.
++  uint32_t HeapQwordOffset = ~0u;
+ 
+   size_t NumStaticSamplers;
+   uint64_t const *EncodedStaticSamplers;
+diff --git a/src/d3d12/d3d12_root_signature.cpp b/src/d3d12/d3d12_root_signature.cpp
+index 7a24aac..79ed182 100644
+--- a/src/d3d12/d3d12_root_signature.cpp
++++ b/src/d3d12/d3d12_root_signature.cpp
+@@ -455,6 +455,11 @@ public:
+     auto [offsets, total_qwords] = CalculateRootSignatureQwordOffsets(desc);
+     qword_offsets_ = offsets;
+     UploadQwords = total_qwords;
++    if (desc.Flags & (D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
++                      D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED)) {
++      HeapQwordOffset = total_qwords;
++      UploadQwords = total_qwords + 2;
++    }
+     ParameterSlots = qword_offsets_.size();
+     SlotQwordOffsets = qword_offsets_.data();
+ 
+-- 
+2.50.1 (Apple Git-155)
+
