@@ -37,6 +37,10 @@ if [ ! -x "$TOOLCHAINS/wine/bin/winebuild" ]; then
 fi
 
 cd "$SRC/dxmt"
+# OverPass's changes to DXMT (overpass/PATCHES.md), applied once to the pinned checkout.
+for patch in "$SRC"/overpass/patches/*.patch; do
+    git apply --reverse --check "$patch" 2>/dev/null || git apply "$patch"
+done
 if [ ! -f "$BUILD/build.ninja" ]; then
     meson setup --cross-file build-win64.txt --buildtype release --strip --prefix "$PREFIX" \
         -Denable_d3d12=true -Denable_nvapi=true -Denable_nvngx=true \

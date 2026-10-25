@@ -1,0 +1,848 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <kimruben@gmail.com>
+Date: Sun, 25 Oct 2026 18:33:50 +0100
+Subject: [PATCH] nvapi: add D3D12, DRS, D3D11 device creation and GPU/display
+ lookup functions
+
+Adds 36 functions DXMT's NVAPI did not have, with behaviour adapted from
+dxvk-nvapi (MIT, notice kept in nvapi_ported.cpp). DRS now opens a session
+instead of failing, so games get past their profile lookup. D3D12 calls
+report what DXMT supports: no NVIDIA shader extensions, no raytracing caps,
+Reflex accepted and ignored. GPU and display lookups use DXMT's existing
+handles (Metal registry IDs, HMONITORs) and PCI IDs come from DXGI.
+---
+ src/nvapi/meson.build      |   1 +
+ src/nvapi/nvapi.cpp        |  22 +-
+ src/nvapi/nvapi_ported.cpp | 755 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 761 insertions(+), 17 deletions(-)
+ create mode 100644 src/nvapi/nvapi_ported.cpp
+
+diff --git a/src/nvapi/meson.build b/src/nvapi/meson.build
+index e03c390..203c206 100644
+--- a/src/nvapi/meson.build
++++ b/src/nvapi/meson.build
+@@ -1,5 +1,6 @@
+ nvapi_src = [
+   'nvapi.cpp',
++  'nvapi_ported.cpp',
+ ]
+ 
+ nvapi_ld_args      = ['-L' + windows_native_install_dir] # a nice trick to force relink
+diff --git a/src/nvapi/nvapi.cpp b/src/nvapi/nvapi.cpp
+index e20b7f6..d6e2c78 100644
+--- a/src/nvapi/nvapi.cpp
++++ b/src/nvapi/nvapi.cpp
+@@ -714,19 +714,6 @@ NvAPI_Stereo_SetDriverMode(NV_STEREO_DRIVER_MODE mode) {
+   return NVAPI_STEREO_NOT_INITIALIZED;
+ }
+ 
+-NVAPI_INTERFACE
+-NvAPI_DRS_CreateSession(NvDRSSessionHandle *phSession) {
+-  if (!phSession)
+-    return NVAPI_INVALID_ARGUMENT;
+-
+-  return NVAPI_NOT_SUPPORTED;
+-}
+-
+-NVAPI_INTERFACE
+-NvAPI_DRS_LoadSettings(NvDRSSessionHandle hSession) {
+-  return NVAPI_NOT_SUPPORTED;
+-}
+-
+ LUID
+ GetAdapterLuid(WMT::Device device) {
+   /**
+@@ -795,6 +782,8 @@ NvAPI_GPU_GetLogicalGpuInfo(NvLogicalGpuHandle hLogicalGpu, NV_LOGICAL_GPU_DATA
+   return NVAPI_OK;
+ }
+ 
++void *nvapi_ported_QueryInterface(NvU32 id);
++
+ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
+   switch (id) {
+   case 0x0150e828:
+@@ -891,10 +880,6 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
+     return (void *)&NvAPI_Stereo_IsEnabled;
+   case 0x5e8f0bec:
+     return (void *)&NvAPI_Stereo_SetDriverMode;
+-  case 0x0694d52e:
+-    return (void *)&NvAPI_DRS_CreateSession;
+-  case 0x375dbd6b:
+-    return (void *)&NvAPI_DRS_LoadSettings;
+   case 0x0ff07fde:
+     return (void *)&NvAPI_GPU_GetAdapterIdFromPhysicalGpu;
+   case 0x842b066e:
+@@ -903,6 +888,9 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
+     break;
+   }
+ 
++  if (auto ported = nvapi_ported_QueryInterface(id))
++    return ported;
++
+   for (auto &iface : nvapi_interface_table) {
+     if (iface.id == id) {
+       ERR("nvapi: function ", iface.func, " not implemented");
+diff --git a/src/nvapi/nvapi_ported.cpp b/src/nvapi/nvapi_ported.cpp
+new file mode 100644
+index 0000000..9f78fe4
+--- /dev/null
++++ b/src/nvapi/nvapi_ported.cpp
+@@ -0,0 +1,755 @@
++/*
++ * NVAPI functions DXMT did not have yet: D3D12, DRS profiles, D3D11 device creation and GPU/display lookups.
++ * Behaviour follows dxvk-nvapi, adapted to DXMT (GPU handles are Metal registry IDs, display handles are
++ * HMONITORs, no D3D12 driver extensions, no raytracing, no NVML).
++ *
++ * Adapted from dxvk-nvapi (https://github.com/jp7677/dxvk-nvapi):
++ *
++ * MIT License
++ *
++ * Copyright (c) 2019 - 2026 Jens Peters, Krzysztof Bogacki
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include "d3d11_1.h"
++#include "d3d12.h"
++#include "dxgi1_6.h"
++#include "com/com_pointer.hpp"
++#include "log/log.hpp"
++#include "nvapi_lite_common.h"
++#include "util_string.hpp"
++#include "Metal.hpp"
++#include "winemetal.h"
++#include <cstring>
++#include <string>
++#define __NVAPI_EMPTY_SAL
++#include "nvapi.h"
++#undef __NVAPI_EMPTY_SAL
++
++namespace dxmt {
++
++LUID GetAdapterLuid(WMT::Device device);
++
++static WMT::Device
++FindDevice(uint64_t registry_id) {
++  auto devices = WMT::CopyAllDevices();
++  for (unsigned i = 0; i < devices.count(); i++) {
++    if (devices.object(i).registryID() == registry_id)
++      return devices.object(i);
++  }
++  return {};
++}
++
++static WMT::Device
++FirstDevice() {
++  auto devices = WMT::CopyAllDevices();
++  if (devices.count() == 0)
++    return {};
++  return devices.object(0);
++}
++
++static bool
++IsMonitor(NvDisplayHandle handle) {
++  MONITORINFO info = {sizeof(info)};
++  return handle && ::GetMonitorInfoW((HMONITOR)handle, &info);
++}
++
++static bool
++IsDisplayId(NvU32 displayId) {
++  return displayId && (displayId == WMTGetPrimaryDisplayId() || displayId == WMTGetSecondaryDisplayId());
++}
++
++// The GPU ID is the low half of the registry ID; NvAPI_GetPhysicalGPUFromGPUID maps it back.
++static NvU32
++GpuId(WMT::Device device) {
++  return NvU32(device.registryID());
++}
++
++/* D3D11 */
++
++using PFN_D3D11CreateDevice = decltype(&::D3D11CreateDevice);
++using PFN_D3D11CreateDeviceAndSwapChain = decltype(&::D3D11CreateDeviceAndSwapChain);
++
++template <typename T>
++static T
++D3D11Proc(const char *name) {
++  static HMODULE d3d11 = ::LoadLibraryA("d3d11.dll");
++  return d3d11 ? reinterpret_cast<T>(::GetProcAddress(d3d11, name)) : nullptr;
++}
++
++NVAPI_INTERFACE
++NvAPI_D3D11_CreateDevice(
++    IDXGIAdapter *pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags,
++    CONST D3D_FEATURE_LEVEL *pFeatureLevels, UINT FeatureLevels, UINT SDKVersion, ID3D11Device **ppDevice,
++    D3D_FEATURE_LEVEL *pFeatureLevel, ID3D11DeviceContext **ppImmediateContext,
++    NVAPI_DEVICE_FEATURE_LEVEL *pSupportedLevel
++) {
++  if (!pSupportedLevel)
++    return NVAPI_INVALID_ARGUMENT;
++
++  auto create = D3D11Proc<PFN_D3D11CreateDevice>("D3D11CreateDevice");
++  if (!create || FAILED(create(
++                     pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion, ppDevice,
++                     pFeatureLevel, ppImmediateContext
++                 )))
++    return NVAPI_ERROR;
++
++  *pSupportedLevel = NVAPI_DEVICE_FEATURE_LEVEL_11_0;
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_D3D11_CreateDeviceAndSwapChain(
++    IDXGIAdapter *pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags,
++    CONST D3D_FEATURE_LEVEL *pFeatureLevels, UINT FeatureLevels, UINT SDKVersion,
++    CONST DXGI_SWAP_CHAIN_DESC *pSwapChainDesc, IDXGISwapChain **ppSwapChain, ID3D11Device **ppDevice,
++    D3D_FEATURE_LEVEL *pFeatureLevel, ID3D11DeviceContext **ppImmediateContext,
++    NVAPI_DEVICE_FEATURE_LEVEL *pSupportedLevel
++) {
++  if (!pSupportedLevel)
++    return NVAPI_INVALID_ARGUMENT;
++
++  auto create = D3D11Proc<PFN_D3D11CreateDeviceAndSwapChain>("D3D11CreateDeviceAndSwapChain");
++  if (!create || FAILED(create(
++                     pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion,
++                     pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext
++                 )))
++    return NVAPI_ERROR;
++
++  *pSupportedLevel = NVAPI_DEVICE_FEATURE_LEVEL_11_0;
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_D3D_RegisterDevice(IUnknown *pDev) {
++  // Nothing to register; acknowledge like the driver does.
++  return NVAPI_OK;
++}
++
++/* D3D12. DXMT has no NVIDIA shader extensions, no raytracing and no opacity micromaps, so these report
++   exactly that instead of being missing. */
++
++NVAPI_INTERFACE
++NvAPI_D3D12_IsNvShaderExtnOpCodeSupported(ID3D12Device *pDevice, NvU32 opCode, bool *pSupported) {
++  if (!pDevice || !pSupported)
++    return NVAPI_INVALID_ARGUMENT;
++
++  *pSupported = false;
++  return NVAPI_OK;
++}
++
++static NvAPI_Status
++SetNvShaderExtnSlotSpace(IUnknown *pDev) {
++  if (!pDev)
++    return NVAPI_INVALID_ARGUMENT;
++
++  Com<ID3D12Device> device;
++  if (FAILED(pDev->QueryInterface(IID_PPV_ARGS(&device))))
++    return NVAPI_INVALID_ARGUMENT;
++
++  return NVAPI_NO_IMPLEMENTATION;
++}
++
++NVAPI_INTERFACE
++NvAPI_D3D12_SetNvShaderExtnSlotSpace(IUnknown *pDev, NvU32 uavSlot, NvU32 uavSpace) {
++  return SetNvShaderExtnSlotSpace(pDev);
++}
++
++NVAPI_INTERFACE
++NvAPI_D3D12_SetNvShaderExtnSlotSpaceLocalThread(IUnknown *pDev, NvU32 uavSlot, NvU32 uavSpace) {
++  return SetNvShaderExtnSlotSpace(pDev);
++}
++
++NVAPI_INTERFACE
++NvAPI_D3D12_GetRaytracingCaps(ID3D12Device *pDevice, NVAPI_D3D12_RAYTRACING_CAPS_TYPE type, void *pData, size_t dataSize) {
++  if (!pDevice || !pData)
++    return NVAPI_INVALID_POINTER;
++
++  switch (type) {
++  case NVAPI_D3D12_RAYTRACING_CAPS_TYPE_THREAD_REORDERING:
++    if (dataSize != sizeof(NVAPI_D3D12_RAYTRACING_THREAD_REORDERING_CAPS))
++      return NVAPI_INVALID_ARGUMENT;
++    *static_cast<NVAPI_D3D12_RAYTRACING_THREAD_REORDERING_CAPS *>(pData) =
++        NVAPI_D3D12_RAYTRACING_THREAD_REORDERING_CAP_NONE;
++    break;
++  case NVAPI_D3D12_RAYTRACING_CAPS_TYPE_OPACITY_MICROMAP:
++    if (dataSize != sizeof(NVAPI_D3D12_RAYTRACING_OPACITY_MICROMAP_CAPS))
++      return NVAPI_INVALID_ARGUMENT;
++    *static_cast<NVAPI_D3D12_RAYTRACING_OPACITY_MICROMAP_CAPS *>(pData) =
++        NVAPI_D3D12_RAYTRACING_OPACITY_MICROMAP_CAP_NONE;
++    break;
++  case NVAPI_D3D12_RAYTRACING_CAPS_TYPE_DISPLACEMENT_MICROMAP:
++    if (dataSize != sizeof(NVAPI_D3D12_RAYTRACING_DISPLACEMENT_MICROMAP_CAPS))
++      return NVAPI_INVALID_ARGUMENT;
++    *static_cast<NVAPI_D3D12_RAYTRACING_DISPLACEMENT_MICROMAP_CAPS *>(pData) =
++        NVAPI_D3D12_RAYTRACING_DISPLACEMENT_MICROMAP_CAP_NONE;
++    break;
++  case NVAPI_D3D12_RAYTRACING_CAPS_TYPE_CLUSTER_OPERATIONS:
++    if (dataSize != sizeof(NVAPI_D3D12_RAYTRACING_CLUSTER_OPERATIONS_CAPS))
++      return NVAPI_INVALID_ARGUMENT;
++    *static_cast<NVAPI_D3D12_RAYTRACING_CLUSTER_OPERATIONS_CAPS *>(pData) =
++        NVAPI_D3D12_RAYTRACING_CLUSTER_OPERATIONS_CAP_NONE;
++    break;
++  case NVAPI_D3D12_RAYTRACING_CAPS_TYPE_PARTITIONED_TLAS:
++    if (dataSize != sizeof(NVAPI_D3D12_RAYTRACING_PARTITIONED_TLAS_CAPS))
++      return NVAPI_INVALID_ARGUMENT;
++    *static_cast<NVAPI_D3D12_RAYTRACING_PARTITIONED_TLAS_CAPS *>(pData) =
++        NVAPI_D3D12_RAYTRACING_PARTITIONED_TLAS_CAP_NONE;
++    break;
++  case NVAPI_D3D12_RAYTRACING_CAPS_TYPE_SPHERES:
++    if (dataSize != sizeof(NVAPI_D3D12_RAYTRACING_SPHERES_CAPS))
++      return NVAPI_INVALID_ARGUMENT;
++    *static_cast<NVAPI_D3D12_RAYTRACING_SPHERES_CAPS *>(pData) = NVAPI_D3D12_RAYTRACING_SPHERES_CAP_NONE;
++    break;
++  case NVAPI_D3D12_RAYTRACING_CAPS_TYPE_LINEAR_SWEPT_SPHERES:
++    if (dataSize != sizeof(NVAPI_D3D12_RAYTRACING_LINEAR_SWEPT_SPHERES_CAPS))
++      return NVAPI_INVALID_ARGUMENT;
++    *static_cast<NVAPI_D3D12_RAYTRACING_LINEAR_SWEPT_SPHERES_CAPS *>(pData) =
++        NVAPI_D3D12_RAYTRACING_LINEAR_SWEPT_SPHERES_CAP_NONE;
++    break;
++  default:
++    return NVAPI_INVALID_ARGUMENT;
++  }
++
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_D3D12_GetRaytracingAccelerationStructurePrebuildInfoEx(
++    ID3D12Device5 *pDevice, NVAPI_GET_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO_EX_PARAMS *pParams
++) {
++  if (!pDevice || !pParams)
++    return NVAPI_INVALID_ARGUMENT;
++  if (pParams->version != NVAPI_GET_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO_EX_PARAMS_VER1)
++    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
++  if (!pParams->pDesc || !pParams->pInfo)
++    return NVAPI_INVALID_ARGUMENT;
++
++  // No DXR in DXMT: the device does not implement ID3D12Device5.
++  return NVAPI_NO_IMPLEMENTATION;
++}
++
++NVAPI_INTERFACE
++NvAPI_D3D12_BuildRaytracingAccelerationStructureEx(
++    ID3D12GraphicsCommandList4 *pCommandList, const NVAPI_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_EX_PARAMS *pParams
++) {
++  if (!pCommandList || !pParams)
++    return NVAPI_INVALID_ARGUMENT;
++  if (pParams->version != NVAPI_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_EX_PARAMS_VER1)
++    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
++  if (!pParams->pDesc)
++    return NVAPI_INVALID_ARGUMENT;
++  if (pParams->numPostbuildInfoDescs && !pParams->pPostbuildInfoDescs)
++    return NVAPI_INVALID_ARGUMENT;
++
++  // No DXR in DXMT: command lists do not implement ID3D12GraphicsCommandList4.
++  return NVAPI_NO_IMPLEMENTATION;
++}
++
++NVAPI_INTERFACE
++NvAPI_D3D12_SetCreatePipelineStateOptions(
++    ID3D12Device5 *pDevice, const NVAPI_D3D12_SET_CREATE_PIPELINE_STATE_OPTIONS_PARAMS *pState
++) {
++  if (!pDevice || !pState)
++    return NVAPI_INVALID_ARGUMENT;
++  if (pState->version != NVAPI_D3D12_SET_CREATE_PIPELINE_STATE_OPTIONS_PARAMS_VER1)
++    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
++
++  // The only option is opacity micromap support, which needs raytracing.
++  return NVAPI_NOT_SUPPORTED;
++}
++
++// Reflex on D3D12 is accepted and ignored, like DXMT's NvAPI_D3D_SetSleepMode and NvAPI_D3D_SetLatencyMarker.
++NVAPI_INTERFACE
++NvAPI_D3D12_NotifyOutOfBandCommandQueue(ID3D12CommandQueue *pCommandQueue, NV_OUT_OF_BAND_CQ_TYPE cqType) {
++  if (!pCommandQueue)
++    return NVAPI_INVALID_POINTER;
++
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_D3D12_SetAsyncFrameMarker(ID3D12CommandQueue *pCommandQueue, NV_ASYNC_FRAME_MARKER_PARAMS *pSetAsyncFrameMarkerParams) {
++  if (!pCommandQueue || !pSetAsyncFrameMarkerParams)
++    return NVAPI_INVALID_POINTER;
++  if (pSetAsyncFrameMarkerParams->version != NV_ASYNC_FRAME_MARKER_PARAMS_VER1)
++    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
++
++  return NVAPI_OK;
++}
++
++/* DRS. One fixed session and profile; nothing is stored, every setting reads as not found. */
++
++static auto s_drs = 1U;
++static auto s_drs_session = reinterpret_cast<NvDRSSessionHandle>(&s_drs);
++static auto s_drs_profile = reinterpret_cast<NvDRSProfileHandle>(&s_drs);
++
++NVAPI_INTERFACE
++NvAPI_DRS_CreateSession(NvDRSSessionHandle *phSession) {
++  if (!phSession)
++    return NVAPI_INVALID_ARGUMENT;
++
++  *phSession = s_drs_session;
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_DRS_DestroySession(NvDRSSessionHandle hSession) {
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_DRS_LoadSettings(NvDRSSessionHandle hSession) {
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_DRS_SaveSettings(NvDRSSessionHandle hSession) {
++  return NVAPI_NOT_SUPPORTED;
++}
++
++NVAPI_INTERFACE
++NvAPI_DRS_SetSetting(NvDRSSessionHandle hSession, NvDRSProfileHandle hProfile, NVDRS_SETTING *pSetting) {
++  return NVAPI_NOT_SUPPORTED;
++}
++
++NVAPI_INTERFACE
++NvAPI_DRS_GetSetting(NvDRSSessionHandle hSession, NvDRSProfileHandle hProfile, NvU32 settingId, NVDRS_SETTING *pSetting) {
++  if (!pSetting)
++    return NVAPI_INVALID_ARGUMENT;
++  if (pSetting->version != NVDRS_SETTING_VER1)
++    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
++
++  return NVAPI_SETTING_NOT_FOUND;
++}
++
++NVAPI_INTERFACE
++NvAPI_DRS_FindProfileByName(NvDRSSessionHandle hSession, NvAPI_UnicodeString profileName, NvDRSProfileHandle *phProfile) {
++  if (!phProfile)
++    return NVAPI_INVALID_ARGUMENT;
++
++  *phProfile = s_drs_profile;
++  return NVAPI_OK;
++}
++
++static void
++CopyUnicodeString(NvAPI_UnicodeString dst, const NvAPI_UnicodeString src) {
++  if (!src)
++    return;
++  for (size_t i = 0; i < NVAPI_UNICODE_STRING_MAX - 1 && src[i]; i++)
++    dst[i] = src[i];
++}
++
++NVAPI_INTERFACE
++NvAPI_DRS_FindApplicationByName(
++    NvDRSSessionHandle hSession, NvAPI_UnicodeString appName, NvDRSProfileHandle *phProfile,
++    NVDRS_APPLICATION *pApplication
++) {
++  if (!phProfile || !pApplication)
++    return NVAPI_INVALID_ARGUMENT;
++
++  switch (pApplication->version) {
++  case NVDRS_APPLICATION_VER_V4:
++    memset(pApplication->commandLine, 0, sizeof(pApplication->commandLine));
++    [[fallthrough]];
++  case NVDRS_APPLICATION_VER_V3:
++    pApplication->isCommandLine = 0;
++    pApplication->isMetro = 0;
++    [[fallthrough]];
++  case NVDRS_APPLICATION_VER_V2:
++    memset(pApplication->fileInFolder, 0, sizeof(pApplication->fileInFolder));
++    [[fallthrough]];
++  case NVDRS_APPLICATION_VER_V1:
++    memset(pApplication->launcher, 0, sizeof(pApplication->launcher));
++    memset(pApplication->userFriendlyName, 0, sizeof(pApplication->userFriendlyName));
++    memset(pApplication->appName, 0, sizeof(pApplication->appName));
++    CopyUnicodeString(pApplication->userFriendlyName, appName);
++    CopyUnicodeString(pApplication->appName, appName);
++    pApplication->isPredefined = 0;
++    break;
++  default:
++    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
++  }
++
++  *phProfile = s_drs_profile;
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_DRS_GetBaseProfile(NvDRSSessionHandle hSession, NvDRSProfileHandle *phProfile) {
++  if (!phProfile)
++    return NVAPI_INVALID_ARGUMENT;
++
++  *phProfile = s_drs_profile;
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_DRS_CreateProfile(NvDRSSessionHandle hSession, NVDRS_PROFILE *pProfileInfo, NvDRSProfileHandle *phProfile) {
++  return NVAPI_NOT_SUPPORTED;
++}
++
++NVAPI_INTERFACE
++NvAPI_DRS_DeleteProfile(NvDRSSessionHandle hSession, NvDRSProfileHandle hProfile) {
++  return NVAPI_NOT_SUPPORTED;
++}
++
++NVAPI_INTERFACE
++NvAPI_DRS_CreateApplication(NvDRSSessionHandle hSession, NvDRSProfileHandle hProfile, NVDRS_APPLICATION *pApplication) {
++  return NVAPI_NOT_SUPPORTED;
++}
++
++/* GPUs */
++
++NVAPI_INTERFACE
++NvAPI_SYS_GetPhysicalGPUs(NV_PHYSICAL_GPUS *pPhysicalGPUs) {
++  if (!pPhysicalGPUs)
++    return NVAPI_INVALID_ARGUMENT;
++  if (pPhysicalGPUs->version != NV_PHYSICAL_GPUS_VER1)
++    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
++
++  auto devices = WMT::CopyAllDevices();
++  auto count = std::min<unsigned>(devices.count(), NVAPI_MAX_PHYSICAL_GPUS);
++  for (unsigned i = 0; i < count; i++) {
++    pPhysicalGPUs->gpuHandleData[i].hPhysicalGpu = (NvPhysicalGpuHandle)devices.object(i).registryID();
++    pPhysicalGPUs->gpuHandleData[i].adapterType = NV_ADAPTER_TYPE_WDDM;
++  }
++  pPhysicalGPUs->gpuHandleCount = count;
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_SYS_GetLogicalGPUs(NV_LOGICAL_GPUS *pLogicalGPUs) {
++  if (!pLogicalGPUs)
++    return NVAPI_INVALID_ARGUMENT;
++  if (pLogicalGPUs->version != NV_LOGICAL_GPUS_VER1)
++    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
++
++  auto devices = WMT::CopyAllDevices();
++  auto count = std::min<unsigned>(devices.count(), NVAPI_MAX_LOGICAL_GPUS);
++  for (unsigned i = 0; i < count; i++) {
++    pLogicalGPUs->gpuHandleData[i].hLogicalGpu = (NvLogicalGpuHandle)devices.object(i).registryID();
++    pLogicalGPUs->gpuHandleData[i].adapterType = NV_ADAPTER_TYPE_WDDM;
++  }
++  pLogicalGPUs->gpuHandleCount = count;
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_GetLogicalGPUFromPhysicalGPU(NvPhysicalGpuHandle hPhysicalGPU, NvLogicalGpuHandle *pLogicalGPU) {
++  if (!pLogicalGPU)
++    return NVAPI_INVALID_ARGUMENT;
++  if (!FindDevice(uint64_t(hPhysicalGPU)))
++    return NVAPI_EXPECTED_PHYSICAL_GPU_HANDLE;
++
++  // One physical GPU per logical GPU, so both use the same handle.
++  *pLogicalGPU = (NvLogicalGpuHandle)hPhysicalGPU;
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_GetPhysicalGPUsFromLogicalGPU(
++    NvLogicalGpuHandle hLogicalGPU, NvPhysicalGpuHandle hPhysicalGPU[NVAPI_MAX_PHYSICAL_GPUS], NvU32 *pGpuCount
++) {
++  if (!hPhysicalGPU || !pGpuCount)
++    return NVAPI_INVALID_ARGUMENT;
++  if (!FindDevice(uint64_t(hLogicalGPU)))
++    return NVAPI_EXPECTED_LOGICAL_GPU_HANDLE;
++
++  hPhysicalGPU[0] = (NvPhysicalGpuHandle)hLogicalGPU;
++  *pGpuCount = 1;
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_GetGPUIDfromPhysicalGPU(NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pGpuId) {
++  if (!pGpuId)
++    return NVAPI_INVALID_ARGUMENT;
++  auto device = FindDevice(uint64_t(hPhysicalGpu));
++  if (!device)
++    return NVAPI_EXPECTED_PHYSICAL_GPU_HANDLE;
++
++  *pGpuId = GpuId(device);
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_GetPhysicalGPUFromGPUID(NvU32 gpuId, NvPhysicalGpuHandle *hPhysicalGpu) {
++  if (!hPhysicalGpu)
++    return NVAPI_INVALID_ARGUMENT;
++
++  auto devices = WMT::CopyAllDevices();
++  for (unsigned i = 0; i < devices.count(); i++) {
++    if (GpuId(devices.object(i)) == gpuId) {
++      *hPhysicalGpu = (NvPhysicalGpuHandle)devices.object(i).registryID();
++      return NVAPI_OK;
++    }
++  }
++  return NVAPI_INVALID_ARGUMENT;
++}
++
++NVAPI_INTERFACE
++NvAPI_GPU_GetGPUType(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_TYPE *pGpuType) {
++  if (!pGpuType)
++    return NVAPI_INVALID_ARGUMENT;
++  if (!FindDevice(uint64_t(hPhysicalGpu)))
++    return NVAPI_EXPECTED_PHYSICAL_GPU_HANDLE;
++
++  // DXMT presents the GPU as a GeForce RTX 4090 (see NvAPI_GPU_GetFullName), a discrete GPU.
++  *pGpuType = NV_SYSTEM_TYPE_DGPU;
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_GPU_GetGPUInfo(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_INFO *pGpuInfo) {
++  if (!pGpuInfo)
++    return NVAPI_INVALID_ARGUMENT;
++  if (!FindDevice(uint64_t(hPhysicalGpu)))
++    return NVAPI_EXPECTED_PHYSICAL_GPU_HANDLE;
++
++  switch (pGpuInfo->version) {
++  case NV_GPU_INFO_VER1: {
++    auto pGpuInfoV1 = reinterpret_cast<NV_GPU_INFO_V1 *>(pGpuInfo);
++    *pGpuInfoV1 = {};
++    pGpuInfoV1->version = NV_GPU_INFO_VER1;
++    break;
++  }
++  case NV_GPU_INFO_VER2:
++    *pGpuInfo = {};
++    pGpuInfo->version = NV_GPU_INFO_VER2;
++    // GeForce RTX 4090, matching NvAPI_GPU_GetArchInfo (AD102).
++    pGpuInfo->rayTracingCores = 128;
++    pGpuInfo->tensorCores = 512;
++    break;
++  default:
++    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
++  }
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_GPU_GetPCIIdentifiers(
++    NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pDeviceId, NvU32 *pSubSystemId, NvU32 *pRevisionId, NvU32 *pExtDeviceId
++) {
++  if (!pDeviceId || !pSubSystemId || !pRevisionId || !pExtDeviceId)
++    return NVAPI_INVALID_ARGUMENT;
++  auto device = FindDevice(uint64_t(hPhysicalGpu));
++  if (!device)
++    return NVAPI_EXPECTED_PHYSICAL_GPU_HANDLE;
++
++  // Report what DXGI reports for this adapter, so dxgi.customDeviceId and friends apply here too.
++  auto luid = GetAdapterLuid(device);
++  Com<IDXGIFactory1> factory;
++  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
++    return NVAPI_ERROR;
++  Com<IDXGIAdapter1> adapter;
++  for (UINT i = 0; SUCCEEDED(factory->EnumAdapters1(i, &adapter)); i++) {
++    DXGI_ADAPTER_DESC1 desc;
++    if (SUCCEEDED(adapter->GetDesc1(&desc)) && desc.AdapterLuid.LowPart == luid.LowPart &&
++        desc.AdapterLuid.HighPart == luid.HighPart) {
++      *pDeviceId = (desc.DeviceId << 16) | desc.VendorId;
++      *pSubSystemId = desc.SubSysId;
++      *pRevisionId = desc.Revision;
++      *pExtDeviceId = desc.DeviceId;
++      return NVAPI_OK;
++    }
++    adapter = nullptr;
++  }
++  return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
++}
++
++NVAPI_INTERFACE
++NvAPI_GPU_GetThermalSettings(NvPhysicalGpuHandle hPhysicalGpu, NvU32 sensorIndex, NV_GPU_THERMAL_SETTINGS *pThermalSettings) {
++  if (!pThermalSettings)
++    return NVAPI_INVALID_ARGUMENT;
++  if (pThermalSettings->version != NV_GPU_THERMAL_SETTINGS_VER_1 &&
++      pThermalSettings->version != NV_GPU_THERMAL_SETTINGS_VER_2)
++    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
++  if (!FindDevice(uint64_t(hPhysicalGpu)))
++    return NVAPI_EXPECTED_PHYSICAL_GPU_HANDLE;
++
++  // No temperature source; dxvk-nvapi answers the same way without NVML.
++  return NVAPI_NO_IMPLEMENTATION;
++}
++
++/* Displays. Display handles are HMONITORs (see NvAPI_EnumNvidiaDisplayHandle); every GPU drives every display
++   (see NvAPI_GetPhysicalGPUsFromDisplay). */
++
++NVAPI_INTERFACE
++NvAPI_GetAssociatedNvidiaDisplayHandle(const char *szDisplayName, NvDisplayHandle *pNvDispHandle) {
++  if (!szDisplayName || !pNvDispHandle)
++    return NVAPI_INVALID_ARGUMENT;
++
++  struct Search {
++    std::string name;
++    HMONITOR found;
++  } search{szDisplayName, nullptr};
++  ::EnumDisplayMonitors(
++      nullptr, nullptr,
++      [](HMONITOR hmon, HDC hdc, LPRECT rect, LPARAM lp) -> BOOL {
++        auto search = reinterpret_cast<Search *>(lp);
++        MONITORINFOEXW info;
++        info.cbSize = sizeof(info);
++        if (!::GetMonitorInfoW(hmon, reinterpret_cast<MONITORINFO *>(&info)))
++          return TRUE;
++        if (search->name != str::fromws(info.szDevice))
++          return TRUE;
++        search->found = hmon;
++        return FALSE;
++      },
++      reinterpret_cast<LPARAM>(&search)
++  );
++
++  if (!search.found)
++    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
++  *pNvDispHandle = (NvDisplayHandle)search.found;
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_GetAssociatedNvidiaDisplayName(NvDisplayHandle NvDispHandle, NvAPI_ShortString szDisplayName) {
++  if (!szDisplayName)
++    return NVAPI_INVALID_ARGUMENT;
++
++  MONITORINFOEXW info;
++  info.cbSize = sizeof(info);
++  if (!NvDispHandle || !::GetMonitorInfoW((HMONITOR)NvDispHandle, reinterpret_cast<MONITORINFO *>(&info)))
++    return NVAPI_EXPECTED_DISPLAY_HANDLE;
++
++  auto name = str::fromws(info.szDevice);
++  auto length = std::min<size_t>(name.size(), NVAPI_SHORT_STRING_MAX - 1);
++  memcpy(szDisplayName, name.c_str(), length);
++  szDisplayName[length] = '\0';
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_GetLogicalGPUFromDisplay(NvDisplayHandle hNvDisp, NvLogicalGpuHandle *pLogicalGPU) {
++  if (!pLogicalGPU)
++    return NVAPI_INVALID_ARGUMENT;
++  if (!IsMonitor(hNvDisp))
++    return NVAPI_EXPECTED_DISPLAY_HANDLE;
++  auto device = FirstDevice();
++  if (!device)
++    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
++
++  *pLogicalGPU = (NvLogicalGpuHandle)device.registryID();
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_SYS_GetPhysicalGpuFromDisplayId(NvU32 displayId, NvPhysicalGpuHandle *hPhysicalGpu) {
++  if (!hPhysicalGpu)
++    return NVAPI_INVALID_ARGUMENT;
++  if (!IsDisplayId(displayId))
++    return NVAPI_INVALID_ARGUMENT;
++  auto device = FirstDevice();
++  if (!device)
++    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
++
++  *hPhysicalGpu = (NvPhysicalGpuHandle)device.registryID();
++  return NVAPI_OK;
++}
++
++void *
++nvapi_ported_QueryInterface(NvU32 id) {
++  switch (id) {
++  case 0x6a16d3a0:
++    return (void *)&NvAPI_D3D11_CreateDevice;
++  case 0xbb939ee5:
++    return (void *)&NvAPI_D3D11_CreateDeviceAndSwapChain;
++  case 0x8c02c4d0:
++    return (void *)&NvAPI_D3D_RegisterDevice;
++  case 0x3dfacec8:
++    return (void *)&NvAPI_D3D12_IsNvShaderExtnOpCodeSupported;
++  case 0xac2dfeb5:
++    return (void *)&NvAPI_D3D12_SetNvShaderExtnSlotSpace;
++  case 0x43d867c0:
++    return (void *)&NvAPI_D3D12_SetNvShaderExtnSlotSpaceLocalThread;
++  case 0x85a6c2a0:
++    return (void *)&NvAPI_D3D12_GetRaytracingCaps;
++  case 0x8d025b77:
++    return (void *)&NvAPI_D3D12_GetRaytracingAccelerationStructurePrebuildInfoEx;
++  case 0xe24ead45:
++    return (void *)&NvAPI_D3D12_BuildRaytracingAccelerationStructureEx;
++  case 0x5c607a27:
++    return (void *)&NvAPI_D3D12_SetCreatePipelineStateOptions;
++  case 0x03d6e8cb:
++    return (void *)&NvAPI_D3D12_NotifyOutOfBandCommandQueue;
++  case 0x13c98f73:
++    return (void *)&NvAPI_D3D12_SetAsyncFrameMarker;
++  case 0x0694d52e:
++    return (void *)&NvAPI_DRS_CreateSession;
++  case 0xdad9cff8:
++    return (void *)&NvAPI_DRS_DestroySession;
++  case 0x375dbd6b:
++    return (void *)&NvAPI_DRS_LoadSettings;
++  case 0xfcbc7e14:
++    return (void *)&NvAPI_DRS_SaveSettings;
++  case 0x577dd202:
++    return (void *)&NvAPI_DRS_SetSetting;
++  case 0x73bf8338:
++    return (void *)&NvAPI_DRS_GetSetting;
++  case 0x7e4a9a0b:
++    return (void *)&NvAPI_DRS_FindProfileByName;
++  case 0xeee566b2:
++    return (void *)&NvAPI_DRS_FindApplicationByName;
++  case 0xda8466a0:
++    return (void *)&NvAPI_DRS_GetBaseProfile;
++  case 0xcc176068:
++    return (void *)&NvAPI_DRS_CreateProfile;
++  case 0x17093206:
++    return (void *)&NvAPI_DRS_DeleteProfile;
++  case 0x4347a9de:
++    return (void *)&NvAPI_DRS_CreateApplication;
++  case 0xd3b24d2d:
++    return (void *)&NvAPI_SYS_GetPhysicalGPUs;
++  case 0xccfffc10:
++    return (void *)&NvAPI_SYS_GetLogicalGPUs;
++  case 0xadd604d1:
++    return (void *)&NvAPI_GetLogicalGPUFromPhysicalGPU;
++  case 0xaea3fa32:
++    return (void *)&NvAPI_GetPhysicalGPUsFromLogicalGPU;
++  case 0x6533ea3e:
++    return (void *)&NvAPI_GetGPUIDfromPhysicalGPU;
++  case 0x5380ad1a:
++    return (void *)&NvAPI_GetPhysicalGPUFromGPUID;
++  case 0xc33baeb1:
++    return (void *)&NvAPI_GPU_GetGPUType;
++  case 0xafd1b02c:
++    return (void *)&NvAPI_GPU_GetGPUInfo;
++  case 0x2ddfb66e:
++    return (void *)&NvAPI_GPU_GetPCIIdentifiers;
++  case 0xe3640a56:
++    return (void *)&NvAPI_GPU_GetThermalSettings;
++  case 0x35c29134:
++    return (void *)&NvAPI_GetAssociatedNvidiaDisplayHandle;
++  case 0x22a78b05:
++    return (void *)&NvAPI_GetAssociatedNvidiaDisplayName;
++  case 0xee1370cf:
++    return (void *)&NvAPI_GetLogicalGPUFromDisplay;
++  case 0x9ea74659:
++    return (void *)&NvAPI_SYS_GetPhysicalGpuFromDisplayId;
++  default:
++    return nullptr;
++  }
++}
++
++} // namespace dxmt
+-- 
+2.50.1 (Apple Git-155)
+
