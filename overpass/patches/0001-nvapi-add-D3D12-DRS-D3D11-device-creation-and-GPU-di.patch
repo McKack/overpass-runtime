@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: McKack <kimruben@gmail.com>
+From: McKack <4465550+McKack@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 18:33:50 +0100
 Subject: [PATCH] nvapi: add D3D12, DRS, D3D11 device creation and GPU/display
  lookup functions
