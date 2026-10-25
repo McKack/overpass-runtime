@@ -1,0 +1,308 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 21:28:35 +0100
+Subject: [PATCH] airconv: DXIL wave and quad vote operations
+
+Wave operations map to Metal SIMD-group functions: active sum/product/min/max,
+prefix sum/product, and/or/xor, ballot, read first lane, any/all/all-equal,
+is-first-lane, bit counts, quadVote and isHelperLane. WaveMatch,
+WaveMultiPrefix and 64-bit reductions (which Metal lacks) combine the 32
+lanes through shuffles. Wave ops are dispatched by opcode, since DXC reuses
+function names across them.
+---
+ src/airconv/nt/dxil_converter_base.cpp | 258 +++++++++++++++++++++++++
+ src/airconv/nt/dxil_converter_base.hpp |   4 +
+ 2 files changed, 262 insertions(+)
+
+diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
+index 5a55028..dd2c7e3 100644
+--- a/src/airconv/nt/dxil_converter_base.cpp
++++ b/src/airconv/nt/dxil_converter_base.cpp
+@@ -868,6 +868,8 @@ Converter::EmitDxilOp(CallInst &Call) {
+     return EmitReadLaneAt(Call, false);
+   if (op == "quadOp")
+     return EmitQuadOp(Call);
++  if (op.startswith("wave") || op == "quadVote" || op == "isHelperLane")
++    return EmitWaveOp(Call, op);
+   if (op == "sampleIndex")
+     return ctx.resource.sample_index_arg;
+   if (op == "coverage")
+@@ -2381,4 +2383,260 @@ Converter::EmitQuadOp(const CallInst &Call) {
+   return air.CreateQuadShuffleXor(*Value, *Kind + 1);
+ }
+ 
++/* Wave (SIMD-group) operations. Apple GPUs run 32 lanes per SIMD-group, so DXIL's 128-bit lane masks only use
++   their first 32 bits. */
++
++Value *
++Converter::SimdCall(const std::string &Name, Type *RetTy, ArrayRef<Value *> Args) {
++  auto &Context = ir.getContext();
++  auto Attrs = AttributeList::get(
++      Context, {{~0U, Attribute::get(Context, Attribute::AttrKind::Convergent)},
++                {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
++                {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)}}
++  );
++  SmallVector<Type *> Tys;
++  for (auto *Arg : Args)
++    Tys.push_back(Arg->getType());
++  auto Fn = air.getModule()->getOrInsertFunction(Name, FunctionType::get(RetTy, Tys, false), Attrs);
++  return ir.CreateCall(Fn, Args);
++}
++
++std::string
++Converter::SimdSuffix(Type *Ty, bool Signed) {
++  if (Ty->isFloatingPointTy())
++    return air.getTypeOverloadSuffix(Ty);
++  return air.getTypeOverloadSuffix(Ty, Signed ? Signedness::Signed : Signedness::Unsigned);
++}
++
++// %dx.types.fouri32 from a 64-bit lane mask.
++Value *
++Converter::LaneMask(Type *StructTy, Value *Mask64) {
++  Value *Result = PoisonValue::get(StructTy);
++  Result = ir.CreateInsertValue(Result, ir.CreateTrunc(Mask64, ir.getInt32Ty()), 0);
++  Result = ir.CreateInsertValue(Result, ir.CreateTrunc(ir.CreateLShr(Mask64, 32), ir.getInt32Ty()), 1);
++  Result = ir.CreateInsertValue(Result, ir.getInt32(0), 2);
++  return ir.CreateInsertValue(Result, ir.getInt32(0), 3);
++}
++
++llvm::Expected<llvm::Value *>
++Converter::EmitWaveOp(const CallInst &Call, StringRef Op) {
++  auto Arg = [&](unsigned i) { return Get(Call.getArgOperand(i)); };
++  auto ConstArg = [&](unsigned i) -> std::optional<uint32_t> {
++    if (auto *C = dyn_cast<ConstantInt>(Call.getArgOperand(i)))
++      return (uint32_t)C->getZExtValue();
++    return std::nullopt;
++  };
++  auto *I1 = ir.getInt1Ty();
++  auto *I32 = ir.getInt32Ty();
++  auto Lane = [&]() { return air.CreateGetBuiltinID("get_thread_index_in_simdgroup"); };
++  auto Active = [&]() { return SimdCall("air.simd_active_threads_mask.i64", ir.getInt64Ty(), {}); };
++  auto Shuffle = [&](Value *V, unsigned LaneId) -> Value * {
++    auto *Ty = V->getType();
++    if (Ty->getPrimitiveSizeInBits() == 64) { // Metal shuffles 32-bit halves
++      auto *I64 = ir.getInt64Ty();
++      auto *Wide = Ty->isDoubleTy() ? ir.CreateBitCast(V, I64) : V;
++      Value *Lo = ir.CreateTrunc(Wide, I32), *Hi = ir.CreateTrunc(ir.CreateLShr(Wide, 32), I32);
++      Lo = SimdCall("air.simd_shuffle.u.i32", I32, {Lo, ir.getInt16(LaneId)});
++      Hi = SimdCall("air.simd_shuffle.u.i32", I32, {Hi, ir.getInt16(LaneId)});
++      Value *Joined = ir.CreateOr(ir.CreateZExt(Lo, I64), ir.CreateShl(ir.CreateZExt(Hi, I64), 32));
++      return Ty->isDoubleTy() ? ir.CreateBitCast(Joined, Ty) : Joined;
++    }
++    return SimdCall("air.simd_shuffle" + SimdSuffix(Ty, false), Ty, {V, ir.getInt16(LaneId)});
++  };
++  // DXC reuses function names across opcodes (WavePrefixBitCount is dx.op.wavePrefixOp), so go by opcode.
++  if (auto Opcode = ConstArg(0)) {
++    if (*Opcode == 135)
++      Op = "waveAllBitCount";
++    else if (*Opcode == 136)
++      Op = "wavePrefixBitCount";
++  }
++  auto Bits = [&](Value *V) -> Value * {
++    auto *Ty = V->getType();
++    return Ty->isFloatingPointTy() ? ir.CreateBitCast(V, IntegerType::get(ir.getContext(), Ty->getPrimitiveSizeInBits())) : V;
++  };
++
++  if (Op == "waveIsFirstLane")
++    return SimdCall("air.simd_is_first", I1, {});
++  if (Op == "isHelperLane") {
++    if (ctx.shader_type != microsoft::D3D10_SB_PIXEL_SHADER)
++      return (Value *)ir.getFalse();
++    return SimdCall("air.simd_is_helper_thread", I1, {});
++  }
++  if (Op == "waveAnyTrue" || Op == "waveAllTrue") {
++    auto V = Arg(1);
++    if (!V)
++      return V.takeError();
++    return SimdCall(Op == "waveAnyTrue" ? "air.simd_any" : "air.simd_all", I1, {*V});
++  }
++  if (Op == "quadVote") {
++    auto V = Arg(1);
++    auto Kind = ConstArg(2);
++    if (!V)
++      return V.takeError();
++    if (!Kind)
++      return unsupported("dxil: non-constant quadVote kind");
++    return SimdCall(*Kind == 0 ? "air.quad_any" : "air.quad_all", I1, {*V});
++  }
++  if (Op == "waveActiveBallot") {
++    auto V = Arg(1);
++    if (!V)
++      return V.takeError();
++    return LaneMask(MapType(Call.getType()), SimdCall("air.simd_ballot.i64", ir.getInt64Ty(), {*V}));
++  }
++  if (Op == "waveReadLaneFirst") {
++    auto V = Arg(1);
++    if (!V)
++      return V.takeError();
++    return SimdCall("air.simd_broadcast_first" + SimdSuffix((*V)->getType(), false), (*V)->getType(), {*V});
++  }
++  if (Op == "waveActiveAllEqual") {
++    auto V = Arg(1);
++    if (!V)
++      return V.takeError();
++    auto *First = SimdCall("air.simd_broadcast_first" + SimdSuffix((*V)->getType(), false), (*V)->getType(), {*V});
++    return SimdCall("air.simd_all", I1, {ir.CreateICmpEQ(Bits(*V), Bits(First))});
++  }
++  if (Op == "waveAllBitCount" || Op == "wavePrefixBitCount") {
++    auto V = Arg(1);
++    if (!V)
++      return V.takeError();
++    auto *One = ir.CreateZExt(*V, I32);
++    return SimdCall(
++        Op == "waveAllBitCount" ? "air.simd_sum.u.i32" : "air.simd_prefix_exclusive_sum.u.i32", I32, {One}
++    );
++  }
++  if (Op == "waveActiveOp" || Op == "wavePrefixOp") {
++    auto V = Arg(1);
++    auto Kind = ConstArg(2), Sign = ConstArg(3);
++    if (!V)
++      return V.takeError();
++    if (!Kind || !Sign)
++      return unsupported("dxil: non-constant wave op kind");
++    auto *Ty = (*V)->getType();
++    bool Signed = *Sign == 0;
++    if (Ty->isIntegerTy(64) || Ty->isDoubleTy()) {
++      // Metal has no 64-bit SIMD-group arithmetic: combine the active lanes (earlier ones, for a prefix) one by one.
++      bool Prefix = Op == "wavePrefixOp";
++      bool Float = Ty->isDoubleTy();
++      Value *Acc = nullptr;
++      switch (*Kind) {
++      case 0: Acc = Float ? ConstantFP::get(Ty, 0.0) : ConstantInt::get(Ty, 0); break;
++      case 1: Acc = Float ? ConstantFP::get(Ty, 1.0) : ConstantInt::get(Ty, 1); break;
++      default: if (Prefix) return unsupported("dxil: unknown wavePrefixOp kind"); break;
++      }
++      Value *Lanes = ir.CreateTrunc(Active(), I32);
++      if (Prefix)
++        Lanes = ir.CreateAnd(Lanes, ir.CreateSub(ir.CreateShl(ir.getInt32(1), Lane()), ir.getInt32(1)));
++      for (unsigned j = 0; j < 32; j++) {
++        auto *Other = Shuffle(*V, j);
++        auto *Bit = ir.CreateICmpNE(ir.CreateAnd(Lanes, ir.getInt32(1u << j)), ir.getInt32(0));
++        if (!Acc) { // min/max start from the lane's own value
++          Acc = *V;
++        }
++        Value *Next;
++        switch (*Kind) {
++        case 0: Next = Float ? ir.CreateFAdd(Acc, Other) : ir.CreateAdd(Acc, Other); break;
++        case 1: Next = Float ? ir.CreateFMul(Acc, Other) : ir.CreateMul(Acc, Other); break;
++        case 2: Next = Float ? ir.CreateMinNum(Acc, Other) : (Signed ? ir.CreateSelect(ir.CreateICmpSLT(Other, Acc), Other, Acc) : ir.CreateSelect(ir.CreateICmpULT(Other, Acc), Other, Acc)); break;
++        default: Next = Float ? ir.CreateMaxNum(Acc, Other) : (Signed ? ir.CreateSelect(ir.CreateICmpSGT(Other, Acc), Other, Acc) : ir.CreateSelect(ir.CreateICmpUGT(Other, Acc), Other, Acc)); break;
++        }
++        Acc = ir.CreateSelect(Bit, Next, Acc);
++      }
++      return Acc;
++    }
++    std::string Name;
++    if (Op == "waveActiveOp") {
++      static const char *Names[] = {"sum", "product", "min", "max"};
++      if (*Kind > 3)
++        return unsupported("dxil: unknown waveActiveOp kind");
++      Name = Names[*Kind];
++    } else {
++      if (*Kind > 1)
++        return unsupported("dxil: unknown wavePrefixOp kind");
++      Name = *Kind == 0 ? "prefix_exclusive_sum" : "prefix_exclusive_product";
++    }
++    // Metal's sums and products don't take a signedness; they behave as two's complement.
++    bool UseSign = Signed && (Name == "min" || Name == "max");
++    return SimdCall("air.simd_" + Name + SimdSuffix(Ty, UseSign), Ty, {*V});
++  }
++  if (Op == "waveActiveBit") {
++    auto V = Arg(1);
++    auto Kind = ConstArg(2);
++    if (!V)
++      return V.takeError();
++    if (!Kind || *Kind > 2)
++      return unsupported("dxil: invalid waveActiveBit kind");
++    static const char *Names[] = {"and", "or", "xor"};
++    auto *Ty = (*V)->getType();
++    if (Ty->isIntegerTy(64)) {
++      auto *Lo = ir.CreateTrunc(*V, I32), *Hi = ir.CreateTrunc(ir.CreateLShr(*V, 32), I32);
++      std::string Name = std::string("air.simd_") + Names[*Kind] + ".u.i32";
++      Lo = SimdCall(Name, I32, {Lo});
++      Hi = SimdCall(Name, I32, {Hi});
++      return ir.CreateOr(ir.CreateZExt(Lo, Ty), ir.CreateShl(ir.CreateZExt(Hi, Ty), 32));
++    }
++    return SimdCall(std::string("air.simd_") + Names[*Kind] + SimdSuffix(Ty, false), Ty, {*V});
++  }
++  if (Op == "waveMatch") {
++    // Lanes holding the same value, by comparing with each lane in turn.
++    auto V = Arg(1);
++    if (!V)
++      return V.takeError();
++    auto *Self = Bits(*V);
++    Value *Mask = ir.getInt64(0);
++    for (unsigned j = 0; j < 32; j++) {
++      auto *Equal = ir.CreateICmpEQ(Bits(Shuffle(*V, j)), Self);
++      Mask = ir.CreateOr(Mask, ir.CreateShl(ir.CreateZExt(Equal, ir.getInt64Ty()), j));
++    }
++    return LaneMask(MapType(Call.getType()), ir.CreateAnd(Mask, Active()));
++  }
++  if (Op == "waveMultiPrefixBitCount") {
++    auto V = Arg(1), MaskX = Arg(2);
++    if (!V)
++      return V.takeError();
++    if (!MaskX)
++      return MaskX.takeError();
++    auto *Ballot = ir.CreateTrunc(SimdCall("air.simd_ballot.i64", ir.getInt64Ty(), {*V}), I32);
++    auto *Before = ir.CreateSub(ir.CreateShl(ir.getInt32(1), Lane()), ir.getInt32(1));
++    auto *Counted = ir.CreateAnd(ir.CreateAnd(Ballot, *MaskX), Before);
++    return ir.CreateUnaryIntrinsic(Intrinsic::ctpop, Counted);
++  }
++  if (Op == "waveMultiPrefixOp") {
++    // Combine the values of earlier lanes that are in the mask, one lane at a time.
++    auto V = Arg(1), MaskX = Arg(2);
++    auto Kind = ConstArg(6);
++    if (!V)
++      return V.takeError();
++    if (!MaskX)
++      return MaskX.takeError();
++    if (!Kind || *Kind > 4)
++      return unsupported("dxil: invalid waveMultiPrefixOp kind");
++    auto *Ty = (*V)->getType();
++    bool Float = Ty->isFloatingPointTy();
++    Value *Acc;
++    switch (*Kind) {
++    case 0: case 2: case 3: Acc = Float ? ConstantFP::get(Ty, 0.0) : ConstantInt::get(Ty, 0); break;
++    case 1: Acc = ConstantInt::getAllOnesValue(Ty); break;
++    default: Acc = Float ? ConstantFP::get(Ty, 1.0) : ConstantInt::get(Ty, 1); break;
++    }
++    auto *Include = ir.CreateAnd(ir.CreateAnd(*MaskX, ir.CreateTrunc(Active(), I32)),
++                                 ir.CreateSub(ir.CreateShl(ir.getInt32(1), Lane()), ir.getInt32(1)));
++    for (unsigned j = 0; j < 32; j++) {
++      auto *Other = Shuffle(*V, j);
++      Value *Next;
++      switch (*Kind) {
++      case 0: Next = Float ? ir.CreateFAdd(Acc, Other) : ir.CreateAdd(Acc, Other); break;
++      case 1: Next = ir.CreateAnd(Acc, Other); break;
++      case 2: Next = ir.CreateOr(Acc, Other); break;
++      case 3: Next = ir.CreateXor(Acc, Other); break;
++      default: Next = Float ? ir.CreateFMul(Acc, Other) : ir.CreateMul(Acc, Other); break;
++      }
++      auto *Bit = ir.CreateICmpNE(ir.CreateAnd(Include, ir.getInt32(1u << j)), ir.getInt32(0));
++      Acc = ir.CreateSelect(Bit, Next, Acc);
++    }
++    return Acc;
++  }
++  return unsupported("dxil: unsupported operation dx.op." + Op.str());
++}
++
+ } // namespace dxmt::dxil
+diff --git a/src/airconv/nt/dxil_converter_base.hpp b/src/airconv/nt/dxil_converter_base.hpp
+index 3b2d377..8ec9250 100644
+--- a/src/airconv/nt/dxil_converter_base.hpp
++++ b/src/airconv/nt/dxil_converter_base.hpp
+@@ -109,6 +109,10 @@ private:
+   llvm::Expected<llvm::Value *> EmitGetTextureSamplePos(const llvm::CallInst &Call);
+   llvm::Expected<llvm::Value *> EmitReadLaneAt(const llvm::CallInst &Call, bool Quad);
+   llvm::Expected<llvm::Value *> EmitQuadOp(const llvm::CallInst &Call);
++  llvm::Expected<llvm::Value *> EmitWaveOp(const llvm::CallInst &Call, llvm::StringRef Op);
++  llvm::Value *SimdCall(const std::string &Name, llvm::Type *RetTy, llvm::ArrayRef<llvm::Value *> Args);
++  std::string SimdSuffix(llvm::Type *Ty, bool Signed);
++  llvm::Value *LaneMask(llvm::Type *StructTy, llvm::Value *Mask64);
+ };
+ 
+ } // namespace dxmt::dxil
+-- 
+2.50.1 (Apple Git-155)
+
