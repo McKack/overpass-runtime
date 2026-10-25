@@ -23,16 +23,38 @@ other CrossOver-derived Wine builds.
 
 ## Status
 
-Planning. Nothing is built yet.
+Early. It builds on a Mac and passes its smoke test (`tests/smoke.c`) under OverPass Wine:
 
-## Layout (planned)
+- **D3D10/11 and DXGI:** DXMT's, unchanged.
+- **D3D12:** a device is created with feature level 11_1 and shader model 6.0. Games that need 12_0 or
+  newer don't run yet.
+- **DLSS → MetalFX:** D3D11 only so far.
+- **NVAPI:** DXMT's functions plus 36 more (D3D12, driver profile sessions, D3D11 device creation,
+  GPU and display queries). Active with `DXMT_ENABLE_NVEXT=1`.
+
+No releases yet, and no CI.
+
+## Building
+
+On a Mac with Xcode and its Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`), plus
+Homebrew's `mingw-w64`, `cmake`, `ninja` and `meson`:
+
+    git submodule update --init --recursive
+    overpass/build.sh
+
+The first run builds LLVM 15 (about 4 minutes on an M4) and downloads Wine headers. The result goes
+to `../install`.
+
+## Layout
 
 | Path | What |
 |---|---|
 | `dxmt/` | DXMT, pinned as a git submodule |
-| `overpass/` | OverPass's patches and additions, with `PATCHES.md` describing each one |
-| `.github/workflows/` | CI build, smoke test and release, as in overpass-wine |
+| `overpass/` | `build.sh`, and OverPass's patches to DXMT in `patches/`, each described in `PATCHES.md` |
+| `tests/smoke.c` | Loads each part the way a game does and checks what it reports |
+| `.github/workflows/` | CI build, smoke test and release, as in overpass-wine (planned) |
 
 ## License
 
-LGPL-2.1-or-later, the same as DXMT's main branch and Wine.
+LGPL-2.1-or-later, the same as DXMT's main branch and Wine. Some added files carry code adapted from
+MIT-licensed projects; their notices are kept at the top of those files.
