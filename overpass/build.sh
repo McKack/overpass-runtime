@@ -39,7 +39,13 @@ fi
 cd "$SRC/dxmt"
 # OverPass's changes to DXMT (overpass/PATCHES.md), applied once to the pinned checkout.
 for patch in "$SRC"/overpass/patches/*.patch; do
-    git apply --reverse --check "$patch" 2>/dev/null || git apply "$patch"
+    if git apply --reverse --check "$patch" 2>/dev/null; then
+        continue                                  # applied
+    elif git apply --check "$patch" 2>/dev/null; then
+        git apply "$patch"
+    else
+        echo "warning: $(basename "$patch") is neither applied nor applicable; assuming it's applied and edited further" >&2
+    fi
 done
 if [ ! -f "$BUILD/build.ninja" ]; then
     meson setup --cross-file build-win64.txt --buildtype release --strip --prefix "$PREFIX" \

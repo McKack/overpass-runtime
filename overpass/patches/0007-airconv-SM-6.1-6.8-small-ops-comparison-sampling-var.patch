@@ -1,0 +1,316 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:40:51 +0100
+Subject: [PATCH] airconv: SM 6.1-6.8 small ops: comparison sampling variants,
+ raw gather, packed math, ViewID, start vertex/instance
+
+SampleCmpLevel, SampleCmpBias and SampleCmpGrad map to Metal sample_compare
+(gradients through a new reference argument on the gradient sample);
+GatherRaw gathers the first channel's bits; dot4add (signed and unsigned),
+dot2add and 8-bit pack/unpack are integer math; SV_StartVertexLocation and
+SV_StartInstanceLocation read Metal's base vertex and instance; ViewID is 0
+(no view instancing). The analysis pass marks the new comparison and gather
+opcodes, so their textures get the right Metal type.
+---
+ src/airconv/dxil_converter.cpp         |   4 +
+ src/airconv/nt/air_builder.cpp         |   9 +-
+ src/airconv/nt/air_builder.hpp         |   3 +-
+ src/airconv/nt/dxil_converter_base.cpp | 160 +++++++++++++++++++++++--
+ src/airconv/nt/dxil_converter_base.hpp |   1 +
+ 5 files changed, 166 insertions(+), 11 deletions(-)
+
+diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
+index ef7fe61..a99b46f 100644
+--- a/src/airconv/dxil_converter.cpp
++++ b/src/airconv/dxil_converter.cpp
+@@ -738,11 +738,15 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
+       case kOpSampleLevel:
+       case kOpSampleGrad:
+       case kOpTextureGather:
++      case kOpTextureGatherRaw:
+         if (auto err = record_usage(false, false, true, false))
+           return err;
+         break;
+       case kOpSampleCmp:
+       case kOpSampleCmpLevelZero:
++      case kOpSampleCmpLevel:
++      case kOpSampleCmpBias:
++      case kOpSampleCmpGrad:
+       case kOpTextureGatherCmp:
+         if (auto err = record_usage(false, false, true, true))
+           return err;
+diff --git a/src/airconv/nt/air_builder.cpp b/src/airconv/nt/air_builder.cpp
+index f56d7fa..bf31216 100644
+--- a/src/airconv/nt/air_builder.cpp
++++ b/src/airconv/nt/air_builder.cpp
+@@ -523,7 +523,7 @@ AIRBuilder::CreateSampleCmpCommon(
+ std::pair<Value *, Value *>
+ AIRBuilder::CreateSampleGrad(
+     const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *DerivX,
+-    Value *DerivY, Value *MinLOD, const int32_t Offset[3]
++    Value *DerivY, Value *MinLOD, const int32_t Offset[3], Value *Reference
+ ) {
+   assert(Texture.kind <= Texture::last_resource_kind);
+   auto &TexInfo = TextureInfo[Texture.kind];
+@@ -569,6 +569,11 @@ AIRBuilder::CreateSampleGrad(
+     Ops.push_back(ArrayIndex);
+   }
+ 
++  if (Reference) {
++    Tys.push_back(getFloatTy());
++    Ops.push_back(Reference);
++  }
++
+   Tys.push_back(getTextureSampleCoordType(Texture));
+   Tys.push_back(getTextureSampleCoordType(Texture));
+   if (options.sampleNaNToZero) {
+@@ -613,7 +618,7 @@ AIRBuilder::CreateSampleGrad(
+   Tys.push_back(getIntTy());
+   Ops.push_back(getInt(0));
+ 
+-  std::string FnName = "air.sample_";
++  std::string FnName = Reference ? "air.sample_compare_" : "air.sample_";
+   FnName += TexInfo.air_symbol_suffix;
+   FnName += "_grad";
+   FnName += getTypeOverloadSuffix(getTexelType(Texture), getTexelSign(Texture));
+diff --git a/src/airconv/nt/air_builder.hpp b/src/airconv/nt/air_builder.hpp
+index 72d9bf5..170ff2a 100644
+--- a/src/airconv/nt/air_builder.hpp
++++ b/src/airconv/nt/air_builder.hpp
+@@ -189,9 +189,10 @@ public:
+     return CreateSampleGrad(Texture, Handle, Sampler, Coord, ArrayIndex, DerivX, DerivY, getFloat(0), Offset);
+   }
+ 
++  // With Reference, a comparison sample (depth textures): sample_compare with gradients.
+   std::pair<Value *, Value *> CreateSampleGrad(
+       const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *DerivX,
+-      Value *DerivY, Value *MinLOD, const int32_t Offset[3]
++      Value *DerivY, Value *MinLOD, const int32_t Offset[3], Value *Reference = nullptr
+   );
+ 
+   Value *CreateAtomicRMW(
+diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
+index dd2c7e3..c4f5070 100644
+--- a/src/airconv/nt/dxil_converter_base.cpp
++++ b/src/airconv/nt/dxil_converter_base.cpp
+@@ -830,8 +830,18 @@ Converter::EmitDxilOp(CallInst &Call) {
+   if (op == "storeOutput")
+     return EmitStoreOutput(Call);
+   if (op == "sample" || op == "sampleLevel" || op == "sampleBias" || op == "sampleCmp" || op == "sampleCmpLevelZero" ||
+-      op == "sampleGrad")
++      op == "sampleGrad" || op == "sampleCmpLevel" || op == "sampleCmpBias" || op == "sampleCmpGrad")
+     return EmitSample(Call, op);
++  if (op == "textureGatherRaw")
++    return EmitGather(Call, op);
++  if (op == "viewID")
++    return (Value *)ir.getInt32(0); // no view instancing: every draw is view 0
++  if (op == "startVertexLocation")
++    return ctx.resource.base_vertex_id ? ctx.resource.base_vertex_id : (Value *)ir.getInt32(0);
++  if (op == "startInstanceLocation")
++    return ctx.resource.base_instance_id ? ctx.resource.base_instance_id : (Value *)ir.getInt32(0);
++  if (op == "dot4AddPacked" || op == "dot2AddHalf" || op == "unpack4x8" || op == "pack4x8")
++    return EmitPackedMath(Call);
+   if (op == "textureGather" || op == "textureGatherCmp")
+     return EmitGather(Call, op);
+   if (op == "unary")
+@@ -1732,6 +1742,51 @@ Converter::EmitSample(const CallInst &Call, StringRef Op) {
+         Texture, TextureDescriptor->ResourceHandle, Sampler, Coord, Array, *Reference, Offset,
+         sample_level{air.getFloat(0)}
+     );
++  } else if (Op == "sampleCmpLevel") {
++    auto Reference = Get(Call.getArgOperand(10));
++    if (!Reference)
++      return Reference.takeError();
++    auto Level = Get(Call.getArgOperand(11));
++    if (!Level)
++      return Level.takeError();
++    std::tie(Value, Residency) = air.CreateSampleCmp(
++        Texture, TextureDescriptor->ResourceHandle, Sampler, Coord, Array, *Reference, Offset, sample_level{*Level}
++    );
++  } else if (Op == "sampleCmpBias") {
++    auto Reference = Get(Call.getArgOperand(10));
++    if (!Reference)
++      return Reference.takeError();
++    auto Bias = Get(Call.getArgOperand(11));
++    if (!Bias)
++      return Bias.takeError();
++    auto Clamp = Get(Call.getArgOperand(12));
++    if (!Clamp)
++      return Clamp.takeError();
++    std::tie(Value, Residency) = air.CreateSampleCmp(
++        Texture, TextureDescriptor->ResourceHandle, Sampler, Coord, Array, *Reference, Offset, sample_bias{*Bias},
++        sample_min_lod_clamp{*Clamp}
++    );
++  } else if (Op == "sampleCmpGrad") {
++    auto Reference = Get(Call.getArgOperand(10));
++    if (!Reference)
++      return Reference.takeError();
++    llvm::Value *D[6];
++    for (unsigned i = 0; i < 6; i++) {
++      auto V = Get(Call.getArgOperand(11 + i));
++      if (!V)
++        return V.takeError();
++      D[i] = *V;
++    }
++    auto Clamp = Get(Call.getArgOperand(17));
++    if (!Clamp)
++      return Clamp.takeError();
++    bool Cube = TextureDescriptor->ResourceKindLogical == Texture::depthcube ||
++                TextureDescriptor->ResourceKindLogical == Texture::depthcube_array;
++    auto *DX = Cube ? MakeVec({D[0], D[1], D[2]}) : MakeVec({D[0], D[1]});
++    auto *DY = Cube ? MakeVec({D[3], D[4], D[5]}) : MakeVec({D[3], D[4]});
++    std::tie(Value, Residency) = air.CreateSampleGrad(
++        Texture, TextureDescriptor->ResourceHandle, Sampler, Coord, Array, DX, DY, *Clamp, Offset, *Reference
++    );
+   } else if (Op == "sampleCmp") {
+     auto Reference = Get(Call.getArgOperand(10));
+     if (!Reference)
+@@ -1821,25 +1876,32 @@ Converter::EmitGather(const CallInst &Call, StringRef Op) {
+   auto Texture = MakeTexture(*TextureDescriptor);
+   auto Sampler = SamplerDescriptor->SamplerHandle;
+ 
+-  auto C0 = Get(Call.getArgOperand(3));
++  // GatherRaw (SM 6.7) has no channel argument: it gathers the first channel's bits.
++  bool Raw = Op == "textureGatherRaw";
++  auto Arg = [&](unsigned i) -> llvm::Expected<llvm::Value *> {
++    if (Raw && i == 9)
++      return (Value *)air.getInt(0);
++    return Get(Call.getArgOperand(i));
++  };
++  auto C0 = Arg(3);
+   if (!C0)
+     return C0.takeError();
+-  auto C1 = Get(Call.getArgOperand(4));
++  auto C1 = Arg(4);
+   if (!C1)
+     return C1.takeError();
+-  auto C2 = Get(Call.getArgOperand(5));
++  auto C2 = Arg(5);
+   if (!C2)
+     return C2.takeError();
+-  auto C3 = Get(Call.getArgOperand(6));
++  auto C3 = Arg(6);
+   if (!C3)
+     return C3.takeError();
+-  auto O0 = Get(Call.getArgOperand(7));
++  auto O0 = Arg(7);
+   if (!O0)
+     return O0.takeError();
+-  auto O1 = Get(Call.getArgOperand(8));
++  auto O1 = Arg(8);
+   if (!O1)
+     return O1.takeError();
+-  auto Component = Get(Call.getArgOperand(9));
++  auto Component = Arg(9);
+   if (!Component)
+     return Component.takeError();
+ 
+@@ -1894,6 +1956,15 @@ Converter::EmitGather(const CallInst &Call, StringRef Op) {
+   }
+   if (!Value)
+     return unsupported("dxil: gather operation failed");
++  if (Raw) { // raw bits of the gathered texels, as the call's integer type
++    auto *TyElement = MapType(Call.getType())->getStructElementType(0);
++    auto *VecTy = cast<FixedVectorType>(Value->getType());
++    if (VecTy->getElementType() != TyElement && TyElement->getPrimitiveSizeInBits() == VecTy->getScalarSizeInBits())
++      Value = ir.CreateBitCast(Value, FixedVectorType::get(TyElement, VecTy->getNumElements()));
++    else if (VecTy->getElementType() != TyElement && TyElement->isIntegerTy() && VecTy->getElementType()->isIntegerTy())
++      Value = ir.CreateTrunc(Value, FixedVectorType::get(TyElement, VecTy->getNumElements()));
++    return BuildResRet(Call, Value, Residency);
++  }
+   // Metal depth texture must use float type, resolve potential type mismatch here
+   if (Call.getType()->getStructElementType(0)->isHalfTy())
+     Value = air.CreateConvertToHalf(Value);
+@@ -2639,4 +2710,77 @@ Converter::EmitWaveOp(const CallInst &Call, StringRef Op) {
+   return unsupported("dxil: unsupported operation dx.op." + Op.str());
+ }
+ 
++// Packed integer math (SM 6.4 / 6.6): dot products of four 8-bit lanes or two halves, 8-bit pack/unpack.
++llvm::Expected<llvm::Value *>
++Converter::EmitPackedMath(const CallInst &Call) {
++  auto Opcode = asU32(Call.getArgOperand(0));
++  if (!Opcode)
++    return unsupported("dxil: non-constant opcode");
++  auto *I32 = ir.getInt32Ty();
++  auto Byte = [&](Value *Packed, unsigned i, bool Signed) -> Value * {
++    auto *B = ir.CreateTrunc(ir.CreateLShr(Packed, i * 8), ir.getInt8Ty());
++    return Signed ? ir.CreateSExt(B, I32) : ir.CreateZExt(B, I32);
++  };
++  switch (*Opcode) {
++  case kOpDot4AddI8Packed:
++  case kOpDot4AddU8Packed: {
++    auto Acc = Get(Call.getArgOperand(1)), A = Get(Call.getArgOperand(2)), B = Get(Call.getArgOperand(3));
++    if (!Acc) return Acc.takeError();
++    if (!A) return A.takeError();
++    if (!B) return B.takeError();
++    bool Signed = *Opcode == kOpDot4AddI8Packed;
++    Value *Sum = *Acc;
++    for (unsigned i = 0; i < 4; i++)
++      Sum = ir.CreateAdd(Sum, ir.CreateMul(Byte(*A, i, Signed), Byte(*B, i, Signed)));
++    return Sum;
++  }
++  case kOpDot2AddHalf: {
++    Value *V[5];
++    for (unsigned i = 0; i < 5; i++) {
++      auto X = Get(Call.getArgOperand(1 + i));
++      if (!X) return X.takeError();
++      V[i] = *X;
++    }
++    auto *F = ir.getFloatTy();
++    auto Ext = [&](Value *H) { return ir.CreateFPExt(H, F); };
++    return ir.CreateFAdd(V[0], ir.CreateFAdd(ir.CreateFMul(Ext(V[1]), Ext(V[3])), ir.CreateFMul(Ext(V[2]), Ext(V[4]))));
++  }
++  case kOpUnpack4x8: {
++    auto Mode = asU32(Call.getArgOperand(1));
++    auto Packed = Get(Call.getArgOperand(2));
++    if (!Packed) return Packed.takeError();
++    bool Signed = Mode && *Mode == 1;
++    auto *TyResult = MapType(Call.getType());
++    auto *TyElement = TyResult->getStructElementType(0);
++    Value *Result = PoisonValue::get(TyResult);
++    for (unsigned i = 0; i < 4; i++) {
++      auto *B = ir.CreateTrunc(ir.CreateLShr(*Packed, i * 8), ir.getInt8Ty());
++      Result = ir.CreateInsertValue(Result, Signed ? ir.CreateSExt(B, TyElement) : ir.CreateZExt(B, TyElement), i);
++    }
++    return Result;
++  }
++  case kOpPack4x8: {
++    auto Mode = asU32(Call.getArgOperand(1));
++    if (!Mode) return unsupported("dxil: non-constant pack mode");
++    Value *Packed = ir.getInt32(0);
++    for (unsigned i = 0; i < 4; i++) {
++      auto X = Get(Call.getArgOperand(2 + i));
++      if (!X) return X.takeError();
++      Value *V = ir.CreateSExtOrTrunc(*X, I32);
++      if (*Mode == 1) { // clamp to [0, 255]
++        V = ir.CreateSelect(ir.CreateICmpSLT(V, ir.getInt32(0)), ir.getInt32(0), V);
++        V = ir.CreateSelect(ir.CreateICmpSGT(V, ir.getInt32(255)), ir.getInt32(255), V);
++      } else if (*Mode == 2) { // clamp to [-128, 127]
++        V = ir.CreateSelect(ir.CreateICmpSLT(V, ir.getInt32(-128)), ir.getInt32(-128), V);
++        V = ir.CreateSelect(ir.CreateICmpSGT(V, ir.getInt32(127)), ir.getInt32(127), V);
++      }
++      Packed = ir.CreateOr(Packed, ir.CreateShl(ir.CreateAnd(V, ir.getInt32(0xff)), i * 8));
++    }
++    return Packed;
++  }
++  default:
++    return unsupported("dxil: unsupported packed math opcode");
++  }
++}
++
+ } // namespace dxmt::dxil
+diff --git a/src/airconv/nt/dxil_converter_base.hpp b/src/airconv/nt/dxil_converter_base.hpp
+index 8ec9250..a1247cf 100644
+--- a/src/airconv/nt/dxil_converter_base.hpp
++++ b/src/airconv/nt/dxil_converter_base.hpp
+@@ -110,6 +110,7 @@ private:
+   llvm::Expected<llvm::Value *> EmitReadLaneAt(const llvm::CallInst &Call, bool Quad);
+   llvm::Expected<llvm::Value *> EmitQuadOp(const llvm::CallInst &Call);
+   llvm::Expected<llvm::Value *> EmitWaveOp(const llvm::CallInst &Call, llvm::StringRef Op);
++  llvm::Expected<llvm::Value *> EmitPackedMath(const llvm::CallInst &Call);
+   llvm::Value *SimdCall(const std::string &Name, llvm::Type *RetTy, llvm::ArrayRef<llvm::Value *> Args);
+   std::string SimdSuffix(llvm::Type *Ty, bool Signed);
+   llvm::Value *LaneMask(llvm::Type *StructTy, llvm::Value *Mask64);
+-- 
+2.50.1 (Apple Git-155)
+
