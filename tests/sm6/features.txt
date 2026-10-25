@@ -1,0 +1,27 @@
+base_vs vs_6_0 6.0 baseline vertex shader
+base_ps ps_6_0 6.0 baseline pixel shader: sample, discard, derivatives
+base_cs cs_6_0 6.0 baseline compute: structured buffers, groupshared, atomics, barriers
+wave_basic cs_6_0 6.0 wave ops: sum, read first lane, lane index, ballot
+wave_more cs_6_0 6.0 wave ops: prefix, min/max, any/all, read lane at, bit ops
+quad_ps ps_6_0 6.0 quad ops in pixel shaders
+int64 cs_6_0 6.0 64-bit integers
+viewid ps_6_1 6.1 SV_ViewID
+barycentrics ps_6_1 6.1 SV_Barycentrics and GetAttributeAtVertex
+half16 cs_6_2 -enable-16bit-types 6.2 16-bit float and int types
+dot4add cs_6_4 -enable-16bit-types 6.4 packed dot products (dot4add_u8packed, dot2add)
+wavematch cs_6_5 6.5 WaveMatch and WaveMultiPrefix
+mesh ms_6_5 6.5 mesh shaders
+amplification as_6_5 6.5 amplification shaders
+heap_resources cs_6_6 6.6 ResourceDescriptorHeap / SamplerDescriptorHeap (bindless)
+atomic64 cs_6_6 6.6 64-bit atomics on buffers and groupshared
+helperlane ps_6_6 6.6 IsHelperLane
+pack8 cs_6_6 6.6 pack/unpack 8-bit intrinsics
+cs_derivatives cs_6_6 6.6 derivatives in compute shaders
+wavesize cs_6_6 6.6 WaveSize attribute
+quadany ps_6_7 6.7 QuadAny / QuadAll
+samplecmplevel ps_6_7 6.7 SampleCmpLevel and raw gather
+rw_msaa cs_6_7 6.7 writable MSAA textures
+dyn_offset ps_6_7 6.7 programmable (non-constant) sample offsets
+startvertex vs_6_8 6.8 SV_StartVertexLocation / SV_StartInstanceLocation
+cmpbias ps_6_8 6.8 SampleCmpBias / SampleCmpGrad
+wavesize_range cs_6_8 6.8 WaveSize ranges

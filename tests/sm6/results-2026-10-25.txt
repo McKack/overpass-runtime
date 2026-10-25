@@ -1,0 +1,28 @@
+PASS      base_vs          6.0 baseline vertex shader
+PASS      base_ps          6.0 baseline pixel shader: sample, discard, derivatives
+PASS      base_cs          6.0 baseline compute: structured buffers, groupshared, atomics, barriers
+FAIL      wave_basic       6.0 wave ops: sum, read first lane, lane index, ballot   | FAIL pipeline 0x80004005 / err:   Failed to compile cs shader: dxil: unsupported operation dx.op.waveActiveOp
+FAIL      wave_more        6.0 wave ops: prefix, min/max, any/all, read lane at, bit ops   | FAIL pipeline 0x80004005 / err:   Failed to compile cs shader: dxil: unsupported operation dx.op.wavePrefixOp
+PASS      quad_ps          6.0 quad ops in pixel shaders
+PASS      int64            6.0 64-bit integers
+FAIL      viewid           6.1 SV_ViewID   | FAIL pipeline 0x80004005 / err:   Failed to compile ps shader: dxil: unsupported operation dx.op.viewID
+FAIL      barycentrics     6.1 SV_Barycentrics and GetAttributeAtVertex   | FAIL pipeline 0x80004005 / err:   Failed to initialize shader: dxil: unsupported pixel shader input layout
+PASS      half16           6.2 16-bit float and int types
+FAIL      dot4add          6.4 packed dot products (dot4add_u8packed, dot2add)   | FAIL pipeline 0x80004005 / err:   Failed to compile cs shader: dxil: unsupported operation dx.op.dot4AddPacked
+FAIL      wavematch        6.5 WaveMatch and WaveMultiPrefix   | FAIL pipeline 0x80004005 / err:   Failed to compile cs shader: dxil: unsupported operation dx.op.waveMatch
+FAIL      mesh             6.5 mesh shaders   | FAIL pipeline 0x80004005 / err:   Failed to initialize shader: dxil: unsupported shader stage ms
+FAIL      amplification    6.5 amplification shaders   | FAIL pipeline 0x80004005 / err:   Failed to initialize shader: dxil: unsupported shader stage as
+FAIL      heap_resources   6.6 ResourceDescriptorHeap / SamplerDescriptorHeap (bindless)   | FAIL pipeline 0x80004005 / err:   Failed to initialize shader: dxil: unsupported resource handle operation dx.op.annotateHandle
+FAIL      atomic64         6.6 64-bit atomics on buffers and groupshared   | FAIL pipeline 0x80004005 / err:   Failed to initialize shader: dxil: unsupported resource handle operation dx.op.annotateHandle
+FAIL      helperlane       6.6 IsHelperLane   | FAIL pipeline 0x80004005 / err:   Failed to compile ps shader: dxil: unsupported operation dx.op.isHelperLane
+FAIL      pack8            6.6 pack/unpack 8-bit intrinsics   | FAIL pipeline 0x80004005 / err:   Failed to compile cs shader: dxil: unsupported operation dx.op.createHandleFromBinding
+FAIL      cs_derivatives   6.6 derivatives in compute shaders   | FAIL pipeline 0x80004005 / err:   Failed to initialize shader: dxil: unsupported resource handle operation dx.op.annotateHandle
+FAIL      wavesize         6.6 WaveSize attribute   | FAIL pipeline 0x80004005 / err:   Failed to compile cs shader: dxil: unsupported operation dx.op.createHandleFromBinding
+FAIL      quadany          6.7 QuadAny / QuadAll   | FAIL pipeline 0x80004005 / err:   Failed to compile ps shader: dxil: unsupported operation dx.op.quadVote
+FAIL      samplecmplevel   6.7 SampleCmpLevel and raw gather   | FAIL pipeline 0x80004005 / err:   Failed to compile ps shader: dxil: unsupported operation dx.op.createHandleFromBinding
+FAIL      rw_msaa          6.7 writable MSAA textures   | FAIL pipeline 0x80004005 / err:   Failed to compile cs shader: dxil: unsupported operation dx.op.createHandleFromBinding
+FAIL      dyn_offset       6.7 programmable (non-constant) sample offsets   | FAIL pipeline 0x80004005 / err:   Failed to initialize shader: dxil: unsupported resource handle operation dx.op.annotateHandle
+FAIL      startvertex      6.8 SV_StartVertexLocation / SV_StartInstanceLocation   | FAIL pipeline 0x80004005 / err:   Failed to compile vs shader: dxil: unsupported operation dx.op.startInstanceLocation
+FAIL      cmpbias          6.8 SampleCmpBias / SampleCmpGrad   | FAIL pipeline 0x80004005 / err:   Failed to compile ps shader: dxil: unsupported operation dx.op.createHandleFromBinding
+FAIL      wavesize_range   6.8 WaveSize ranges   | FAIL pipeline 0x80004005 / err:   Failed to compile cs shader: dxil: unsupported operation dx.op.createHandleFromBinding
+done

@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 21:10:07 +0100
+Subject: [PATCH] airconv: SM 6.6 resource handles (createHandleFromBinding,
+ annotateHandle)
+
+Shaders compiled for shader model 6.6 and later name resources by binding
+(class, space, lower bound) and wrap handles in annotateHandle. Both now
+resolve to the same range a resource record names, in the analysis pass and
+in code generation, so these shaders get as far as SM 6.0 ones do.
+---
+ src/airconv/dxil_converter.cpp         | 35 +++++++++++++++++++---
+ src/airconv/nt/dxil_converter_base.cpp | 41 ++++++++++++++++++++++++++
+ src/airconv/nt/dxil_converter_base.hpp |  2 ++
+ 3 files changed, 74 insertions(+), 4 deletions(-)
+
+diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
+index 76ae758..ef7fe61 100644
+--- a/src/airconv/dxil_converter.cpp
++++ b/src/airconv/dxil_converter.cpp
+@@ -78,8 +78,29 @@ to_shader_resource_type(ResourceKind kind) {
+ // defined in `nt/dxil_converter_base.hpp`
+ std::optional<uint32_t> asU32(llvm::Value *value);
+ 
++// SM 6.6 handles: the range a %dx.types.ResBind {lower bound, upper bound, space, class} constant names.
+ llvm::Expected<std::pair<uint8_t, uint32_t>>
+-resolve_handle(const llvm::Value *handle) {
++resolve_binding(const llvm::Value *binding, const EntryPoint &entry) {
++  auto *constant = dyn_cast<Constant>(binding);
++  if (!constant)
++    return unsupported("dxil: non-constant resource binding");
++  auto element = [&](unsigned i) -> std::optional<uint32_t> {
++    auto *value = constant->getAggregateElement(i);
++    return value ? asU32(value) : std::nullopt;
++  };
++  auto lower_bound = element(0), space = element(2), res_class = element(3);
++  if (!lower_bound || !space || !res_class)
++    return unsupported("dxil: malformed resource binding");
++  for (auto &resource : entry.resources) {
++    if ((uint32_t)resource.resource_class == *res_class && resource.space == *space &&
++        resource.lower_bound == *lower_bound)
++      return std::make_pair((uint8_t)*res_class, resource.id);
++  }
++  return unsupported("dxil: no resource for binding");
++}
++
++llvm::Expected<std::pair<uint8_t, uint32_t>>
++resolve_handle(const llvm::Value *handle, const EntryPoint &entry) {
+   if (auto *ci = dyn_cast<CallInst>(handle)) {
+     if (auto *callee = ci->getCalledFunction()) {
+       StringRef name = callee->getName();
+@@ -90,6 +111,10 @@ resolve_handle(const llvm::Value *handle) {
+           return unsupported("dxil: non-constant createHandle arguments");
+         return std::make_pair((uint8_t)*res_class, *range);
+       }
++      if (name == "dx.op.createHandleFromBinding")
++        return resolve_binding(ci->getArgOperand(1), entry);
++      if (name == "dx.op.annotateHandle")
++        return resolve_handle(ci->getArgOperand(1), entry);
+       return unsupported("dxil: unsupported resource handle operation " + name.str());
+     }
+   }
+@@ -657,7 +682,7 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
+         continue;
+ 
+       auto record_usage = [&](bool read, bool written, bool sampled, bool compared) -> llvm::Error {
+-        auto key = resolve_handle(ci->getArgOperand(1));
++        auto key = resolve_handle(ci->getArgOperand(1), entry);
+         if (!key)
+           return key.takeError();
+         switch ((ResourceClass)key->first) {
+@@ -685,8 +710,10 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
+       };
+ 
+       switch (*opcode) {
+-      case kOpCreateHandle: {
+-        auto key = resolve_handle(ci);
++      case kOpCreateHandle:
++      case kOpCreateHandleFromBinding:
++      case kOpAnnotateHandle: {
++        auto key = resolve_handle(ci, entry);
+         if (!key)
+           return key.takeError();
+         break;
+diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
+index 7bf1752..5a55028 100644
+--- a/src/airconv/nt/dxil_converter_base.cpp
++++ b/src/airconv/nt/dxil_converter_base.cpp
+@@ -787,6 +787,10 @@ Converter::EmitDxilOp(CallInst &Call) {
+ 
+   if (op == "createHandle")
+     return EmitCreateHandle(Call);
++  if (op == "createHandleFromBinding")
++    return EmitCreateHandleFromBinding(Call);
++  if (op == "annotateHandle")
++    return EmitAnnotateHandle(Call);
+   if (op == "cbufferLoadLegacy")
+     return EmitCbufferLoadLegacy(Call);
+   if (op == "threadId")
+@@ -888,6 +892,43 @@ Converter::EmitCreateHandle(CallInst &Call) {
+   return (llvm::Value *)nullptr;
+ }
+ 
++// SM 6.6: createHandleFromBinding(%dx.types.ResBind binding, i32 index, i1 nonUniform), where index is the absolute
++// register like createHandle's. The binding names the same range a resource record (and createHandle) does.
++llvm::Expected<llvm::Value *>
++Converter::EmitCreateHandleFromBinding(CallInst &Call) {
++  auto *Binding = dyn_cast<Constant>(Call.getArgOperand(1));
++  if (!Binding)
++    return unsupported("dxil: non-constant resource binding");
++  auto Element = [&](unsigned i) -> std::optional<uint32_t> {
++    auto *Value = Binding->getAggregateElement(i);
++    return Value ? asU32(Value) : std::nullopt;
++  };
++  auto LowerBound = Element(0), Space = Element(2), Class = Element(3);
++  if (!LowerBound || !Space || !Class)
++    return unsupported("dxil: malformed resource binding");
++  auto Index = Get(Call.getArgOperand(2));
++  if (!Index)
++    return Index.takeError();
++  for (auto &Resource : entry.resources) {
++    if ((uint32_t)Resource.resource_class == *Class && Resource.space == *Space &&
++        Resource.lower_bound == *LowerBound) {
++      handles_[&Call] = HandleInfo{(ResourceClass)*Class, Resource.id, *Index};
++      return (llvm::Value *)nullptr;
++    }
++  }
++  return unsupported("dxil: no resource for binding");
++}
++
++// SM 6.6: annotateHandle(handle, %dx.types.ResourceProperties) describes a handle; it is the same resource.
++llvm::Expected<llvm::Value *>
++Converter::EmitAnnotateHandle(CallInst &Call) {
++  auto Handle = ResolveHandleOperand(Call.getArgOperand(1));
++  if (!Handle)
++    return Handle.takeError();
++  handles_[&Call] = *Handle;
++  return (llvm::Value *)nullptr;
++}
++
+ llvm::Expected<llvm::Value *>
+ Converter::EmitCbufferLoadLegacy(CallInst &Call) {
+   auto Handle = ResolveHandleOperand(Call.getArgOperand(1));
+diff --git a/src/airconv/nt/dxil_converter_base.hpp b/src/airconv/nt/dxil_converter_base.hpp
+index 32f8e11..3b2d377 100644
+--- a/src/airconv/nt/dxil_converter_base.hpp
++++ b/src/airconv/nt/dxil_converter_base.hpp
+@@ -77,6 +77,8 @@ private:
+ 
+   llvm::Expected<llvm::Value *> EmitDxilOp(llvm::CallInst &Call);
+   llvm::Expected<llvm::Value *> EmitCreateHandle(llvm::CallInst &Call);
++  llvm::Expected<llvm::Value *> EmitCreateHandleFromBinding(llvm::CallInst &Call);
++  llvm::Expected<llvm::Value *> EmitAnnotateHandle(llvm::CallInst &Call);
+   llvm::Expected<llvm::Value *> EmitCbufferLoadLegacy(llvm::CallInst &Call);
+   llvm::Expected<llvm::Value *> EmitThreadId(llvm::CallInst &Call, ThreadBuiltin Kind);
+   llvm::Expected<llvm::Value *> EmitBufferStore(llvm::CallInst &Call);
+-- 
+2.50.1 (Apple Git-155)
+
