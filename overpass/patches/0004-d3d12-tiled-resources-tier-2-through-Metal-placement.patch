@@ -1,0 +1,1499 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 20:19:21 +0100
+Subject: [PATCH] d3d12: tiled resources tier 2 through Metal placement sparse;
+ report feature level 12_0
+
+Reserved textures (2D, no MSAA) and buffers are Metal placement sparse
+resources with 64 KB pages, the size of D3D12 tiles, and D3D12 heaps can now
+back their tiles. UpdateTileMappings and CopyTileMappings run on a Metal 4
+queue, fenced against the D3D12 queue with an event, so earlier work sees the
+old mappings and later work the new ones. GetResourceTiling reports Metal's
+tile shapes (the D3D12 standard shapes for 2D) and packed mip tail. With
+placement sparse available (macOS 26.4+), the device reports tiled resources
+tier 2 and feature level 12_0; otherwise nothing changes.
+
+winemetal: placement sparse textures and buffers, tile size and mip tail
+queries, a Metal 4 queue with mapping updates and copies, event wait/signal,
+and the heap's max compatible placement sparse page size.
+---
+ src/d3d12/d3d12_buffer.cpp          |  42 ++++++-
+ src/d3d12/d3d12_command_queue.cpp   | 167 +++++++++++++++++++++++++-
+ src/d3d12/d3d12_device.cpp          |  37 +++++-
+ src/d3d12/d3d12_device.hpp          |  15 +++
+ src/d3d12/d3d12_heap.cpp            |   3 +
+ src/d3d12/d3d12_texture.cpp         |  47 +++++++-
+ src/d3d12/d3d12_tiling.cpp          | 167 ++++++++++++++++++++++++++
+ src/d3d12/d3d12_tiling.hpp          |  67 +++++++++++
+ src/d3d12/meson.build               |   1 +
+ src/dxmt/dxmt_buffer.cpp            |  26 ++++
+ src/dxmt/dxmt_buffer.hpp            |   7 ++
+ src/dxmt/dxmt_texture.cpp           |  13 ++
+ src/dxmt/dxmt_texture.hpp           |   4 +
+ src/winemetal/Metal.hpp             |  68 +++++++++++
+ src/winemetal/unix/winemetal_unix.c | 176 ++++++++++++++++++++++++++++
+ src/winemetal/winemetal.h           |  96 ++++++++++++++-
+ src/winemetal/winemetal_thunks.c    | 131 +++++++++++++++++++++
+ src/winemetal/winemetal_thunks.h    |  31 +++++
+ 18 files changed, 1082 insertions(+), 16 deletions(-)
+ create mode 100644 src/d3d12/d3d12_tiling.cpp
+ create mode 100644 src/d3d12/d3d12_tiling.hpp
+
+diff --git a/src/d3d12/d3d12_buffer.cpp b/src/d3d12/d3d12_buffer.cpp
+index 5a80937..f6bbfe8 100644
+--- a/src/d3d12/d3d12_buffer.cpp
++++ b/src/d3d12/d3d12_buffer.cpp
+@@ -34,7 +34,7 @@ public:
+   HRESULT
+   Initialize(
+       const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC *pDesc,
+-      const D3D12_CLEAR_VALUE *OptimizedClearValue, MTLD3D12Heap *pHeap, UINT64 Offset
++      const D3D12_CLEAR_VALUE *OptimizedClearValue, MTLD3D12Heap *pHeap, UINT64 Offset, bool Reserved = false
+   ) {
+     if (OptimizedClearValue)
+       return E_INVALIDARG;
+@@ -60,7 +60,13 @@ public:
+     buffer = new Buffer(desc_.Width, device_->GetMTLDevice());
+ 
+     Flags<BufferAllocationFlag> flags;
+-    if (pHeap)
++    if (Reserved) {
++      auto allocation = buffer->allocatePlacementSparse(flags, WMTSparsePageSize64);
++      if (!allocation)
++        return E_OUTOFMEMORY;
++      buffer->rename(std::move(allocation));
++      tiling = std::make_unique<TileLayout>(TileLayout::ForBuffer(desc_.Width));
++    } else if (pHeap)
+       buffer->rename(buffer->allocate(flags, pHeap->heap, Offset));
+     else
+       buffer->rename(buffer->allocate(flags));
+@@ -252,7 +258,20 @@ public:
+       UINT *TotalTileCount, D3D12_PACKED_MIP_INFO *PackedMipInfo, D3D12_TILE_SHAPE *StandardTitleShape,
+       UINT *SubresourceTilingCount, UINT FirstSubresourceTiling, D3D12_SUBRESOURCE_TILING *SubresourceTilings
+   ) {
+-    IMPLEMENT_ME
++    if (tiling)
++      return tiling->GetResourceTiling(
++          TotalTileCount, PackedMipInfo, StandardTitleShape, SubresourceTilingCount, FirstSubresourceTiling,
++          SubresourceTilings
++      );
++    // Not a tiled resource: no tiles.
++    if (TotalTileCount)
++      *TotalTileCount = 0;
++    if (PackedMipInfo)
++      *PackedMipInfo = {};
++    if (StandardTitleShape)
++      *StandardTitleShape = {};
++    if (SubresourceTilingCount)
++      *SubresourceTilingCount = 0;
+   };
+ };
+ 
+@@ -290,4 +309,19 @@ CreatePlacedBuffer(
+   return buffer->QueryInterface(riid, ppResource);
+ }
+ 
+-} // namespace dxmt
+\ No newline at end of file
++HRESULT
++CreateReservedBuffer(
++    MTLD3D12Device *pDevice, const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState,
++    const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
++) {
++  auto buffer = Com(new MTLD3D12Buffer(pDevice));
++  D3D12_HEAP_PROPERTIES heap_props = {D3D12_HEAP_TYPE_DEFAULT};
++  HRESULT hr = buffer->Initialize(&heap_props, D3D12_HEAP_FLAG_NONE, pDesc, OptimizedClearValue, nullptr, 0, true);
++  if (FAILED(hr))
++    return hr;
++  if (!ppResource)
++    return S_FALSE;
++  return buffer->QueryInterface(riid, ppResource);
++}
++
++} // namespace dxmt
+diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
+index 981ecdb..340d581 100644
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -42,6 +42,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+   WMT::Reference<WMT::CommandQueue> queue_;
+   WMT::Reference<WMT::Fence> fence_;
+ 
++  // Tile mapping updates run on a Metal 4 queue, ordered against queue_ with an event.
++  WMT::Reference<WMT::MTL4CommandQueue> mapping_queue_;
++  WMT::Reference<WMT::Event> mapping_event_;
++  uint64_t mapping_event_value_ = 0;
++
+   std::atomic_uint64_t inflight_cmdbuf_seq_ = 1;
+   std::atomic_uint64_t inflight_cmdbuf_count_ = 0;
+   std::atomic_uint64_t inflight_cmdbuf_stop_ = 0;
+@@ -180,13 +185,116 @@ public:
+     return E_NOINTERFACE;
+   }
+ 
++  // Work submitted before a mapping update sees the old mappings, work submitted after sees the new ones.
++  bool
++  BeginMappingUpdate() {
++    if (!mapping_queue_) {
++      auto metal_device = device_->GetMTLDevice();
++      mapping_queue_ = metal_device.newMTL4CommandQueue();
++      mapping_event_ = metal_device.newEvent();
++      if (!mapping_queue_ || !mapping_event_) {
++        ERR("UpdateTileMappings: no Metal 4 queue for tile mappings");
++        mapping_queue_ = {};
++        return false;
++      }
++    }
++    {
++      auto scope = StartCommitting();
++      scope.inflight.cmdbuf.encodeSignalEvent(mapping_event_, ++mapping_event_value_);
++    }
++    mapping_queue_.waitForEvent(mapping_event_, mapping_event_value_);
++    return true;
++  }
++
++  void
++  EndMappingUpdate() {
++    mapping_queue_.signalEvent(mapping_event_, ++mapping_event_value_);
++    auto scope = StartCommitting();
++    scope.inflight.cmdbuf.encodeWaitForEvent(mapping_event_, mapping_event_value_);
++  }
++
+   void STDMETHODCALLTYPE UpdateTileMappings(
+       ID3D12Resource *resource, UINT region_count, const D3D12_TILED_RESOURCE_COORDINATE *region_start_coordinates,
+       const D3D12_TILE_REGION_SIZE *region_sizes, ID3D12Heap *heap, UINT range_count,
+       const D3D12_TILE_RANGE_FLAGS *range_flags, const UINT *heap_range_offsets, const UINT *range_tile_counts,
+       D3D12_TILE_MAPPING_FLAGS flags
+   ) {
+-    IMPLEMENT_ME
++    auto res = static_cast<MTLD3D12Resource *>(resource);
++    if (!res || !res->tiling)
++      return;
++    auto &layout = *res->tiling;
++
++    // The resource's tiles, region after region. Without sizes a region is one tile, or the whole resource
++    // when there are no start coordinates either.
++    std::vector<uint32_t> tiles;
++    for (UINT i = 0; i < region_count; i++) {
++      D3D12_TILED_RESOURCE_COORDINATE start = region_start_coordinates ? region_start_coordinates[i]
++                                                                       : D3D12_TILED_RESOURCE_COORDINATE{};
++      D3D12_TILE_REGION_SIZE size{};
++      if (region_sizes)
++        size = region_sizes[i];
++      else
++        size.NumTiles = region_start_coordinates ? 1 : layout.total_tiles;
++      CollectRegionTiles(layout, start, size, tiles);
++    }
++
++    // Paired with heap tiles, range after range.
++    WMT::Heap metal_heap = heap ? WMT::Heap(static_cast<MTLD3D12Heap *>(heap)->heap) : WMT::Heap{};
++    std::vector<WMTSparseTextureMappingOperation> texture_ops;
++    std::vector<WMTSparseBufferMappingOperation> buffer_ops;
++    size_t next = 0;
++    for (UINT r = 0; r < range_count && next < tiles.size(); r++) {
++      auto range_flag = range_flags ? range_flags[r] : D3D12_TILE_RANGE_FLAG_NONE;
++      uint32_t offset = heap_range_offsets ? heap_range_offsets[r] : 0;
++      uint32_t count = range_tile_counts ? range_tile_counts[r] : uint32_t(tiles.size() - next);
++      for (uint32_t k = 0; k < count && next < tiles.size(); k++, next++) {
++        if (range_flag & D3D12_TILE_RANGE_FLAG_SKIP)
++          continue;
++        bool map = !(range_flag & D3D12_TILE_RANGE_FLAG_NULL);
++        if (map && !heap)
++          continue;
++        uint64_t heap_tile = (range_flag & D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE) ? offset : offset + k;
++        auto mode = map ? WMTSparseMappingModeMap : WMTSparseMappingModeUnmap;
++        TileRef tile = layout.TileAt(tiles[next]);
++
++        // Neighbouring tiles that take neighbouring heap tiles become one operation.
++        if (layout.is_buffer) {
++          if (!buffer_ops.empty()) {
++            auto &last = buffer_ops.back();
++            if (last.mode == mode && last.location + last.length == tile.x &&
++                (!map || last.heap_offset + last.length == heap_tile)) {
++              last.length++;
++              continue;
++            }
++          }
++          buffer_ops.push_back({mode, tile.x, 1, map ? heap_tile : 0});
++        } else {
++          if (!texture_ops.empty()) {
++            auto &last = texture_ops.back();
++            if (last.mode == mode && last.level == tile.level && last.slice == tile.slice &&
++                last.origin.y == tile.y && last.origin.z == tile.z && last.size.height == 1 &&
++                last.size.depth == 1 && last.origin.x + last.size.width == tile.x &&
++                (!map || last.heap_offset + last.size.width == heap_tile)) {
++              last.size.width++;
++              continue;
++            }
++          }
++          texture_ops.push_back({mode, {tile.x, tile.y, tile.z}, {1, 1, 1}, tile.level, tile.slice, map ? heap_tile : 0});
++        }
++      }
++    }
++    if (texture_ops.empty() && buffer_ops.empty())
++      return;
++
++    if (!BeginMappingUpdate())
++      return;
++    if (layout.is_buffer)
++      mapping_queue_.updateBufferMappings(res->buffer->current()->buffer(), metal_heap, buffer_ops.data(), buffer_ops.size());
++    else
++      mapping_queue_.updateTextureMappings(
++          res->texture->current()->texture(), metal_heap, texture_ops.data(), texture_ops.size()
++      );
++    EndMappingUpdate();
+   };
+ 
+   void STDMETHODCALLTYPE CopyTileMappings(
+@@ -194,7 +302,62 @@ public:
+       ID3D12Resource *src_resource, const D3D12_TILED_RESOURCE_COORDINATE *src_region_start_coordinate,
+       const D3D12_TILE_REGION_SIZE *region_size, D3D12_TILE_MAPPING_FLAGS flags
+   ) {
+-    IMPLEMENT_ME
++    auto dst = static_cast<MTLD3D12Resource *>(dst_resource);
++    auto src = static_cast<MTLD3D12Resource *>(src_resource);
++    if (!dst || !src || !dst->tiling || !src->tiling || !region_size || !dst_region_start_coordinate ||
++        !src_region_start_coordinate || dst->tiling->is_buffer != src->tiling->is_buffer)
++      return;
++
++    std::vector<uint32_t> src_tiles, dst_tiles;
++    CollectRegionTiles(*src->tiling, *src_region_start_coordinate, *region_size, src_tiles);
++    CollectRegionTiles(*dst->tiling, *dst_region_start_coordinate, *region_size, dst_tiles);
++    size_t count = std::min(src_tiles.size(), dst_tiles.size());
++
++    std::vector<WMTSparseTextureCopyOperation> texture_ops;
++    std::vector<WMTSparseBufferCopyOperation> buffer_ops;
++    for (size_t i = 0; i < count; i++) {
++      TileRef s = src->tiling->TileAt(src_tiles[i]), d = dst->tiling->TileAt(dst_tiles[i]);
++      if (src->tiling->is_buffer) {
++        if (!buffer_ops.empty()) {
++          auto &last = buffer_ops.back();
++          if (last.src_location + last.src_length == s.x && last.dst_location + last.src_length == d.x) {
++            last.src_length++;
++            continue;
++          }
++        }
++        buffer_ops.push_back({s.x, 1, d.x});
++      } else {
++        if (s.packed != d.packed)
++          continue;
++        if (!texture_ops.empty()) {
++          auto &last = texture_ops.back();
++          if (last.src_level == s.level && last.src_slice == s.slice && last.dst_level == d.level &&
++              last.dst_slice == d.slice && last.src_origin.y == s.y && last.src_origin.z == s.z &&
++              last.dst_origin.y == d.y && last.dst_origin.z == d.z && last.src_size.height == 1 &&
++              last.src_size.depth == 1 && last.src_origin.x + last.src_size.width == s.x &&
++              last.dst_origin.x + last.src_size.width == d.x) {
++            last.src_size.width++;
++            continue;
++          }
++        }
++        texture_ops.push_back({{s.x, s.y, s.z}, {1, 1, 1}, s.level, s.slice, {d.x, d.y, d.z}, d.level, d.slice});
++      }
++    }
++    if (texture_ops.empty() && buffer_ops.empty())
++      return;
++
++    if (!BeginMappingUpdate())
++      return;
++    if (src->tiling->is_buffer)
++      mapping_queue_.copyBufferMappings(
++          src->buffer->current()->buffer(), dst->buffer->current()->buffer(), buffer_ops.data(), buffer_ops.size()
++      );
++    else
++      mapping_queue_.copyTextureMappings(
++          src->texture->current()->texture(), dst->texture->current()->texture(), texture_ops.data(),
++          texture_ops.size()
++      );
++    EndMappingUpdate();
+   };
+ 
+   void STDMETHODCALLTYPE
+diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
+index 877986d..46bf8b3 100644
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -246,7 +246,9 @@ public:
+       D3D_FEATURE_LEVEL max_level = {};
+       for (unsigned i = 0; i < out->NumFeatureLevels; i++)
+         max_level = std::max(out->pFeatureLevelsRequested[i], max_level);
+-      out->MaxSupportedFeatureLevel = std::min(max_level, D3D_FEATURE_LEVEL_11_1);
++      // 12_0 needs tiled resources tier 2 (with resource binding tier 2 and typed UAV loads, both reported).
++      out->MaxSupportedFeatureLevel =
++          std::min(max_level, SupportsTiledResources() ? D3D_FEATURE_LEVEL_12_0 : D3D_FEATURE_LEVEL_11_1);
+       return S_OK;
+     }
+     case D3D12_FEATURE_FORMAT_INFO:  {
+@@ -289,7 +291,8 @@ public:
+       out->DoublePrecisionFloatShaderOps = FALSE;
+       out->OutputMergerLogicOp = FALSE;
+       out->MinPrecisionSupport = D3D12_SHADER_MIN_PRECISION_SUPPORT_16_BIT;
+-      out->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
++      out->TiledResourcesTier =
++          SupportsTiledResources() ? D3D12_TILED_RESOURCES_TIER_2 : D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
+       out->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_2;
+       out->PSSpecifiedStencilRefSupported = TRUE;
+       out->TypedUAVLoadAdditionalFormats = TRUE;
+@@ -677,9 +680,27 @@ public:
+       const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState,
+       const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **resource
+   ) {
+-    return E_NOTIMPL;
++    if (!pDesc || !SupportsTiledResources())
++      return E_INVALIDARG;
++    switch (pDesc->Dimension) {
++    case D3D12_RESOURCE_DIMENSION_BUFFER:
++      return CreateReservedBuffer(this, pDesc, InitialState, OptimizedClearValue, riid, resource);
++    case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
++      // Tier 2 covers 2D textures (and arrays) without MSAA.
++      if (pDesc->SampleDesc.Count > 1)
++        return E_INVALIDARG;
++      return CreateReservedTexture(this, pDesc, InitialState, OptimizedClearValue, riid, resource);
++    default:
++      return E_INVALIDARG;
++    }
+   };
+ 
++  // Tiled resources tier 2, through Metal placement sparse resources (macOS 26.4+).
++  bool
++  SupportsTiledResources() {
++    return GetMTLDevice().supportsPlacementSparse();
++  }
++
+   HRESULT STDMETHODCALLTYPE
+   CreateSharedHandle(
+       ID3D12DeviceChild *object, const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, HANDLE *handle
+@@ -850,7 +871,11 @@ public:
+       D3D12_TILE_SHAPE *StandardTileShape, UINT *SubresourceTilingCount, UINT FirstSubresourceTiling,
+       D3D12_SUBRESOURCE_TILING *SubresourceTilings
+   ) {
+-    IMPLEMENT_ME
++    if (pResource)
++      static_cast<MTLD3D12Resource *>(pResource)->GetResourceTiling(
++          TotalTileCount, PackedMipInfo, StandardTileShape, SubresourceTilingCount, FirstSubresourceTiling,
++          SubresourceTilings
++      );
+   };
+ 
+   LUID *STDMETHODCALLTYPE
+@@ -1149,7 +1174,9 @@ public:
+       const D3D12_CLEAR_VALUE *OptimizedClearValue, ID3D12ProtectedResourceSession *pSession, REFIID riid,
+       void **ppResource
+   ) {
+-    return E_NOTIMPL;
++    if (pSession)
++      return E_NOTIMPL;
++    return CreateReservedResource(pDesc, InitialState, OptimizedClearValue, riid, ppResource);
+   }
+ 
+   D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index 3af4bb4..a7b63d8 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -20,6 +20,7 @@
+ #include "d3d12.h"
+ #include "d3d12_command_encoder.hpp"
+ #include "d3d12_descriptor_heap.hpp"
++#include "d3d12_tiling.hpp"
+ #include "dxgi1_2.h"
+ #include "dxgi_interfaces.h"
+ #include "airconv_public.h"
+@@ -63,6 +64,8 @@ class MTLD3D12Resource : public ID3D12Resource {
+ public:
+   Rc<Texture> texture;
+   Rc<Buffer> buffer;
++  // Reserved (tiled) resources only.
++  std::unique_ptr<TileLayout> tiling;
+ 
+   virtual HRESULT STDMETHODCALLTYPE
+   CreateShaderResourceView(const D3D12_SHADER_RESOURCE_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Descriptor) = 0;
+@@ -242,6 +245,18 @@ CreatePlacedBuffer(
+     D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
+ );
+ 
++HRESULT
++CreateReservedTexture(
++    MTLD3D12Device *pDevice, const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState,
++    const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
++);
++
++HRESULT
++CreateReservedBuffer(
++    MTLD3D12Device *pDevice, const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState,
++    const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
++);
++
+ HRESULT
+ CreateHeap(MTLD3D12Device *pDevice, const D3D12_HEAP_DESC *pDesc, REFIID riid, void **ppHeap);
+ 
+diff --git a/src/d3d12/d3d12_heap.cpp b/src/d3d12/d3d12_heap.cpp
+index 2448ed0..444dab3 100644
+--- a/src/d3d12/d3d12_heap.cpp
++++ b/src/d3d12/d3d12_heap.cpp
+@@ -86,6 +86,9 @@ public:
+     info.size = size_aligned;
+     info.sparse_page_size = WMTSparsePageSize16;
+     info.type = WMTHeapTypePlacement;
++    // Lets the heap back tiles of reserved (tiled) resources, which use D3D12's 64 KB tiles.
++    info.max_compatible_placement_sparse_page_size =
++        device_->GetMTLDevice().supportsPlacementSparse() ? WMTSparsePageSize64 : WMTSparsePageSize(0);
+ 
+     heap = device_->GetMTLDevice().newHeap(info);
+ 
+diff --git a/src/d3d12/d3d12_texture.cpp b/src/d3d12/d3d12_texture.cpp
+index 5d29ca1..f92ca40 100644
+--- a/src/d3d12/d3d12_texture.cpp
++++ b/src/d3d12/d3d12_texture.cpp
+@@ -181,7 +181,7 @@ public:
+   HRESULT
+   Initialize(
+       const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC *pDesc,
+-      D3D12_RESOURCE_STATES InitialState, MTLD3D12Heap *pHeap, UINT64 HeapOffset
++      D3D12_RESOURCE_STATES InitialState, MTLD3D12Heap *pHeap, UINT64 HeapOffset, bool Reserved = false
+   ) {
+     // TODO: validate and normalize
+     desc_ = *pDesc;
+@@ -219,7 +219,18 @@ public:
+ 
+     texture = new Texture(texture_info, device_->GetMTLDevice());
+     Flags<TextureAllocationFlag> flags = {};
+-    if (pHeap) {
++    if (Reserved) {
++      auto allocation = texture->allocatePlacementSparse(flags, WMTSparsePageSize64);
++      if (!allocation)
++        return E_OUTOFMEMORY;
++      texture->rename(std::move(allocation));
++      tiling = std::make_unique<TileLayout>();
++      if (!TileLayout::ForTexture(device_->GetMTLDevice(), desc_, texture_info, texture->current()->texture(), *tiling)) {
++        ERR("CreateReservedResource: no 64 KB tiles for format ", desc_.Format);
++        return E_INVALIDARG;
++      }
++      device_->RegisterResidency(texture->current()->texture());
++    } else if (pHeap) {
+       texture->rename(texture->allocate(flags, pHeap->heap, HeapOffset));
+     } else {
+       texture->rename(texture->allocate(flags));
+@@ -840,7 +851,20 @@ public:
+       UINT *TotalTileCount, D3D12_PACKED_MIP_INFO *PackedMipInfo, D3D12_TILE_SHAPE *StandardTitleShape,
+       UINT *SubresourceTilingCount, UINT FirstSubresourceTiling, D3D12_SUBRESOURCE_TILING *SubresourceTilings
+   ) {
+-    IMPLEMENT_ME
++    if (tiling)
++      return tiling->GetResourceTiling(
++          TotalTileCount, PackedMipInfo, StandardTitleShape, SubresourceTilingCount, FirstSubresourceTiling,
++          SubresourceTilings
++      );
++    // Not a tiled resource: no tiles.
++    if (TotalTileCount)
++      *TotalTileCount = 0;
++    if (PackedMipInfo)
++      *PackedMipInfo = {};
++    if (StandardTitleShape)
++      *StandardTitleShape = {};
++    if (SubresourceTilingCount)
++      *SubresourceTilingCount = 0;
+   };
+ };
+ 
+@@ -883,4 +907,19 @@ CreatePlacedTexture(
+   return texture->QueryInterface(riid, ppResource);
+ }
+ 
+-} // namespace dxmt
+\ No newline at end of file
++HRESULT
++CreateReservedTexture(
++    MTLD3D12Device *pDevice, const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState,
++    const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
++) {
++  auto texture = Com(new MTLD3D12Texture(pDevice));
++  D3D12_HEAP_PROPERTIES heap_props = {D3D12_HEAP_TYPE_DEFAULT};
++  HRESULT hr = texture->Initialize(&heap_props, D3D12_HEAP_FLAG_NONE, pDesc, InitialState, nullptr, 0, true);
++  if (FAILED(hr))
++    return hr;
++  if (!ppResource)
++    return S_FALSE;
++  return texture->QueryInterface(riid, ppResource);
++}
++
++} // namespace dxmt
+diff --git a/src/d3d12/d3d12_tiling.cpp b/src/d3d12/d3d12_tiling.cpp
+new file mode 100644
+index 0000000..971a6eb
+--- /dev/null
++++ b/src/d3d12/d3d12_tiling.cpp
+@@ -0,0 +1,167 @@
++#include "d3d12_tiling.hpp"
++#include <algorithm>
++
++namespace dxmt {
++
++static uint32_t
++div_up(uint64_t value, uint64_t divisor) {
++  return uint32_t((value + divisor - 1) / divisor);
++}
++
++TileLayout
++TileLayout::ForBuffer(uint64_t width) {
++  TileLayout layout;
++  layout.is_buffer = true;
++  layout.shape = {kTileSizeInBytes, 1, 1};
++  layout.total_tiles = layout.tiles_per_slice = div_up(width, kTileSizeInBytes);
++  layout.mips.push_back({layout.total_tiles, 1, 1, 0});
++  return layout;
++}
++
++bool
++TileLayout::ForTexture(
++    WMT::Device device, const D3D12_RESOURCE_DESC &desc, const WMTTextureInfo &info, WMT::Texture texture,
++    TileLayout &out
++) {
++  TileLayout layout;
++  uint64_t tile_bytes = 0;
++  auto tile = device.sparseTileSize(info.type, info.pixel_format, info.sample_count, WMTSparsePageSize64, &tile_bytes);
++  if (tile_bytes != kTileSizeInBytes || !tile.width || !tile.height || !tile.depth)
++    return false;
++  layout.shape = {uint32_t(tile.width), uint32_t(tile.height), uint32_t(tile.depth)};
++  layout.mip_levels = info.mipmap_level_count;
++  layout.array_size = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize;
++
++  auto [first_tail_level, tail_bytes] = texture.sparseTail();
++  layout.standard_mips = std::min<uint32_t>(first_tail_level, layout.mip_levels);
++  layout.packed_tiles = layout.standard_mips < layout.mip_levels ? div_up(tail_bytes, kTileSizeInBytes) : 0;
++
++  uint32_t start = 0;
++  for (uint32_t level = 0; level < layout.standard_mips; level++) {
++    uint32_t width = std::max<uint32_t>(1, info.width >> level);
++    uint32_t height = std::max<uint32_t>(1, info.height >> level);
++    uint32_t depth = std::max<uint32_t>(1, info.depth >> level);
++    D3D12_SUBRESOURCE_TILING mip = {
++        div_up(width, layout.shape.WidthInTexels), uint16_t(div_up(height, layout.shape.HeightInTexels)),
++        uint16_t(div_up(depth, layout.shape.DepthInTexels)), start
++    };
++    start += mip.WidthInTiles * mip.HeightInTiles * mip.DepthInTiles;
++    layout.mips.push_back(mip);
++  }
++  layout.tiles_per_slice = start + layout.packed_tiles;
++  layout.total_tiles = layout.tiles_per_slice * layout.array_size;
++  out = std::move(layout);
++  return true;
++}
++
++uint32_t
++TileLayout::SubresourceStart(uint32_t subresource) const {
++  if (is_buffer)
++    return 0;
++  uint32_t level = subresource % mip_levels, slice = subresource / mip_levels;
++  uint32_t base = slice * tiles_per_slice;
++  if (level >= standard_mips)
++    return base + tiles_per_slice - packed_tiles;
++  return base + mips[level].StartTileIndexInOverallResource;
++}
++
++uint32_t
++TileLayout::IndexOf(const D3D12_TILED_RESOURCE_COORDINATE &coord) const {
++  if (coord.Subresource >= SubresourceCount())
++    return UINT32_MAX;
++  if (is_buffer)
++    return coord.X < total_tiles ? coord.X : UINT32_MAX;
++  uint32_t level = coord.Subresource % mip_levels;
++  if (level >= standard_mips)
++    return coord.X < packed_tiles ? SubresourceStart(coord.Subresource) + coord.X : UINT32_MAX;
++  auto &mip = mips[level];
++  if (coord.X >= mip.WidthInTiles || coord.Y >= mip.HeightInTiles || coord.Z >= mip.DepthInTiles)
++    return UINT32_MAX;
++  return SubresourceStart(coord.Subresource) + (coord.Z * mip.HeightInTiles + coord.Y) * mip.WidthInTiles + coord.X;
++}
++
++TileRef
++TileLayout::TileAt(uint32_t index) const {
++  TileRef tile{};
++  if (is_buffer) {
++    tile.x = index;
++    return tile;
++  }
++  tile.slice = index / tiles_per_slice;
++  uint32_t in_slice = index % tiles_per_slice;
++  for (uint32_t level = 0; level < standard_mips; level++) {
++    auto &mip = mips[level];
++    uint32_t count = mip.WidthInTiles * mip.HeightInTiles * mip.DepthInTiles;
++    if (in_slice < mip.StartTileIndexInOverallResource + count) {
++      uint32_t local = in_slice - mip.StartTileIndexInOverallResource;
++      tile.level = level;
++      tile.x = local % mip.WidthInTiles;
++      tile.y = (local / mip.WidthInTiles) % mip.HeightInTiles;
++      tile.z = local / (mip.WidthInTiles * mip.HeightInTiles);
++      return tile;
++    }
++  }
++  tile.packed = true;
++  tile.level = standard_mips;
++  tile.x = in_slice - (tiles_per_slice - packed_tiles);
++  return tile;
++}
++
++void
++TileLayout::GetResourceTiling(
++    UINT *pTotalTileCount, D3D12_PACKED_MIP_INFO *pPackedMipInfo, D3D12_TILE_SHAPE *pStandardTileShape,
++    UINT *pSubresourceTilingCount, UINT FirstSubresourceTiling, D3D12_SUBRESOURCE_TILING *pSubresourceTilings
++) const {
++  if (pTotalTileCount)
++    *pTotalTileCount = total_tiles;
++  if (pPackedMipInfo) {
++    pPackedMipInfo->NumStandardMips = is_buffer ? 0 : standard_mips;
++    pPackedMipInfo->NumPackedMips = is_buffer ? 0 : mip_levels - standard_mips;
++    pPackedMipInfo->NumTilesForPackedMips = packed_tiles;
++    pPackedMipInfo->StartTileIndexInOverallResource = packed_tiles ? tiles_per_slice - packed_tiles : 0;
++  }
++  if (pStandardTileShape)
++    *pStandardTileShape = shape;
++  if (pSubresourceTilingCount) {
++    uint32_t count = SubresourceCount();
++    uint32_t first = std::min(FirstSubresourceTiling, count);
++    uint32_t written = std::min(*pSubresourceTilingCount, count - first);
++    for (uint32_t i = 0; pSubresourceTilings && i < written; i++) {
++      uint32_t subresource = first + i;
++      uint32_t level = is_buffer ? 0 : subresource % mip_levels;
++      if (!is_buffer && level >= standard_mips) {
++        pSubresourceTilings[i] = {0, 0, 0, D3D12_PACKED_TILE};
++      } else {
++        pSubresourceTilings[i] = mips[level];
++        pSubresourceTilings[i].StartTileIndexInOverallResource = SubresourceStart(subresource);
++      }
++    }
++    *pSubresourceTilingCount = written;
++  }
++}
++
++void
++CollectRegionTiles(
++    const TileLayout &layout, const D3D12_TILED_RESOURCE_COORDINATE &start, const D3D12_TILE_REGION_SIZE &size,
++    std::vector<uint32_t> &out
++) {
++  if (!size.UseBox) {
++    uint32_t first = layout.IndexOf(start);
++    if (first == UINT32_MAX)
++      return;
++    uint32_t count = std::min<uint32_t>(size.NumTiles, layout.total_tiles - first);
++    for (uint32_t i = 0; i < count; i++)
++      out.push_back(first + i);
++    return;
++  }
++  for (uint32_t z = 0; z < size.Depth; z++)
++    for (uint32_t y = 0; y < size.Height; y++)
++      for (uint32_t x = 0; x < size.Width; x++) {
++        D3D12_TILED_RESOURCE_COORDINATE coord = {start.X + x, start.Y + y, start.Z + z, start.Subresource};
++        uint32_t index = layout.IndexOf(coord);
++        if (index != UINT32_MAX)
++          out.push_back(index);
++      }
++}
++
++} // namespace dxmt
+diff --git a/src/d3d12/d3d12_tiling.hpp b/src/d3d12/d3d12_tiling.hpp
+new file mode 100644
+index 0000000..2eb48bf
+--- /dev/null
++++ b/src/d3d12/d3d12_tiling.hpp
+@@ -0,0 +1,67 @@
++#pragma once
++
++#include "d3d12.h"
++#include "Metal.hpp"
++#include <cstdint>
++#include <vector>
++
++namespace dxmt {
++
++/* Tiled (reserved) resources use D3D12's 64 KB tiles, backed by Metal placement sparse pages of the same size.
++
++   D3D12 numbers a resource's tiles in one sequence: for each array slice, the tiles of each regular mip level
++   in X, Y, Z order, then that slice's packed mip tiles. TileLayout describes that sequence and converts between
++   an index in it and a tile Metal understands. */
++
++constexpr uint32_t kTileSizeInBytes = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
++
++struct TileRef {
++  uint32_t level;  // for packed tiles: the first packed mip
++  uint32_t slice;
++  uint32_t x, y, z; // for packed tiles: x is the index in the slice's packed tiles
++  bool packed;
++};
++
++class TileLayout {
++public:
++  bool is_buffer = false;
++  D3D12_TILE_SHAPE shape{};    // texels per tile; for buffers 64 KB x 1 x 1 bytes
++  uint32_t mip_levels = 1;
++  uint32_t array_size = 1;
++  uint32_t standard_mips = 1;  // mips before the packed tail
++  uint32_t packed_tiles = 0;   // per slice
++  uint32_t tiles_per_slice = 0;
++  uint32_t total_tiles = 0;
++  std::vector<D3D12_SUBRESOURCE_TILING> mips; // per standard mip, StartTileIndexInOverallResource relative to the slice
++
++  // Buffers: tiles of `width` bytes.
++  static TileLayout ForBuffer(uint64_t width);
++
++  // Textures: needs the created placement sparse texture for its packed mip tail.
++  static bool ForTexture(WMT::Device device, const D3D12_RESOURCE_DESC &desc, const WMTTextureInfo &info,
++                         WMT::Texture texture, TileLayout &out);
++
++  uint32_t SubresourceCount() const { return is_buffer ? 1 : mip_levels * array_size; }
++
++  // Index of a subresource's first tile, or of a packed subresource's slice tail.
++  uint32_t SubresourceStart(uint32_t subresource) const;
++
++  // Index of a tile given by D3D12 coordinates, or UINT32_MAX when out of range.
++  uint32_t IndexOf(const D3D12_TILED_RESOURCE_COORDINATE &coord) const;
++
++  TileRef TileAt(uint32_t index) const;
++
++  void GetResourceTiling(
++      UINT *pTotalTileCount, D3D12_PACKED_MIP_INFO *pPackedMipInfo, D3D12_TILE_SHAPE *pStandardTileShape,
++      UINT *pSubresourceTilingCount, UINT FirstSubresourceTiling, D3D12_SUBRESOURCE_TILING *pSubresourceTilings
++  ) const;
++};
++
++// The tile indices a D3D12 region covers, in order. A region without a box runs on through later subresources.
++void
++CollectRegionTiles(
++    const TileLayout &layout, const D3D12_TILED_RESOURCE_COORDINATE &start, const D3D12_TILE_REGION_SIZE &size,
++    std::vector<uint32_t> &out
++);
++
++} // namespace dxmt
+diff --git a/src/d3d12/meson.build b/src/d3d12/meson.build
+index ce23ea6..86ee871 100644
+--- a/src/d3d12/meson.build
++++ b/src/d3d12/meson.build
+@@ -17,6 +17,7 @@ d3d12_src = [
+   'd3d12_sampler.cpp',
+   'd3d12_swapchain.cpp',
+   'd3d12_texture.cpp',
++  'd3d12_tiling.cpp',
+   '../d3d10/d3d10_blob.cpp',
+ ]
+ 
+diff --git a/src/dxmt/dxmt_buffer.cpp b/src/dxmt/dxmt_buffer.cpp
+index 9a4139d..415ebf9 100644
+--- a/src/dxmt/dxmt_buffer.cpp
++++ b/src/dxmt/dxmt_buffer.cpp
+@@ -70,6 +70,18 @@ BufferAllocation::BufferAllocation(
+   mappedMemory_ = info_.memory.get_accessible_or_null();
+ }
+ 
++BufferAllocation::BufferAllocation(
++    WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, WMTSparsePageSize page_size
++) :
++    info_(info),
++    flags_(flags) {
++  suballocation_size_ = info_.length;
++  fenceTrackers.resize(suballocation_count_);
++  obj_ = device.newPlacementSparseBuffer(info_, page_size);
++  gpuAddress_ = info_.gpu_address;
++  mappedMemory_ = nullptr;
++}
++
+ void
+ BufferAllocation::free() {
+   if (placed_buffer) {
+@@ -207,6 +219,20 @@ Buffer::allocate(Flags<BufferAllocationFlag> flags, WMT::Heap heap, uint64_t hea
+   return new BufferAllocation(device_, info, flags, heap, heap_offset);
+ };
+ 
++Rc<BufferAllocation>
++Buffer::allocatePlacementSparse(Flags<BufferAllocationFlag> flags, WMTSparsePageSize page_size) {
++  WMTBufferInfo info;
++  info.memory.set(0);
++  info.length = length_;
++  info.options = WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate;
++  flags.set(BufferAllocationFlag::CpuInvisible);
++  flags.set(BufferAllocationFlag::PlacementSparse);
++  Rc<BufferAllocation> allocation = new BufferAllocation(device_, info, flags, page_size);
++  if (!allocation->buffer())
++    return nullptr;
++  return allocation;
++}
++
+ Rc<BufferAllocation>
+ Buffer::rename(Rc<BufferAllocation> &&newAllocation) {
+   Rc<BufferAllocation> old = std::move(current_);
+diff --git a/src/dxmt/dxmt_buffer.hpp b/src/dxmt/dxmt_buffer.hpp
+index 057e767..7c4e507 100644
+--- a/src/dxmt/dxmt_buffer.hpp
++++ b/src/dxmt/dxmt_buffer.hpp
+@@ -41,6 +41,8 @@ enum class BufferAllocationFlag : uint32_t {
+   SuballocateFromOnePage = 5,
+   CpuPlaced = 6,
+   AllocatedOnHeap = 7,
++  /* no memory of its own: pages are mapped from heaps (D3D12 reserved resources) */
++  PlacementSparse = 8,
+ };
+ 
+ struct BufferViewKey {
+@@ -152,6 +154,9 @@ private:
+       WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, WMT::Heap heap,
+       uint64_t heap_offset
+   );
++  BufferAllocation(
++      WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, WMTSparsePageSize page_size
++  );
+   void free();
+ 
+   BufferAllocation(const BufferAllocation &) = delete;
+@@ -185,6 +190,8 @@ public:
+ 
+   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags);
+   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset);
++  // A placement sparse buffer; null when Metal can't create one.
++  Rc<BufferAllocation> allocatePlacementSparse(Flags<BufferAllocationFlag> flags, WMTSparsePageSize page_size);
+ 
+   Rc<BufferAllocation> rename(Rc<BufferAllocation> &&newAllocation);
+ 
+diff --git a/src/dxmt/dxmt_texture.cpp b/src/dxmt/dxmt_texture.cpp
+index 0e5b4bd..28bc3ae 100644
+--- a/src/dxmt/dxmt_texture.cpp
++++ b/src/dxmt/dxmt_texture.cpp
+@@ -222,6 +222,19 @@ Texture::allocate(Flags<TextureAllocationFlag> flags, WMT::Heap heap, uint64_t h
+   return new TextureAllocation(this, heap.newTexture(info, heap_offset), info, flags);
+ }
+ 
++Rc<TextureAllocation>
++Texture::allocatePlacementSparse(Flags<TextureAllocationFlag> flags, WMTSparsePageSize page_size) {
++  WMTTextureInfo info = info_; // copy
++  info.mach_port = 0;
++  info.options = WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate;
++  flags.set(TextureAllocationFlag::CpuInvisible);
++  flags.set(TextureAllocationFlag::PlacementSparse);
++  auto texture = device_.newPlacementSparseTexture(info, page_size);
++  if (!texture)
++    return nullptr;
++  return new TextureAllocation(this, std::move(texture), info, flags);
++}
++
+ Rc<TextureAllocation>
+ Texture::import(mach_port_t mach_port) {
+   Flags<TextureAllocationFlag> flags;
+diff --git a/src/dxmt/dxmt_texture.hpp b/src/dxmt/dxmt_texture.hpp
+index ba57499..a26fa0d 100644
+--- a/src/dxmt/dxmt_texture.hpp
++++ b/src/dxmt/dxmt_texture.hpp
+@@ -39,6 +39,8 @@ enum class TextureAllocationFlag : uint32_t {
+   Shared = 5,
+   ShaderReadonly = 6,
+   AllocatedOnHeap = 7,
++  /* no memory of its own: tiles are mapped from heaps (D3D12 reserved resources) */
++  PlacementSparse = 8,
+ };
+ 
+ struct TextureViewDescriptor {
+@@ -277,6 +279,8 @@ public:
+ 
+   Rc<TextureAllocation> allocate(Flags<TextureAllocationFlag> flags);
+   Rc<TextureAllocation> allocate(Flags<TextureAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset = 0);
++  // A placement sparse texture; null when Metal can't create one.
++  Rc<TextureAllocation> allocatePlacementSparse(Flags<TextureAllocationFlag> flags, WMTSparsePageSize page_size);
+   Rc<TextureAllocation> import(mach_port_t mach_port);
+ 
+   TextureView &view(TextureViewKey key);
+diff --git a/src/winemetal/Metal.hpp b/src/winemetal/Metal.hpp
+index 8224a0c..2c3fb96 100644
+--- a/src/winemetal/Metal.hpp
++++ b/src/winemetal/Metal.hpp
+@@ -222,6 +222,14 @@ public:
+ 
+ class Texture : public Resource {
+ public:
++  // Placement sparse textures: first mip level in the packed tail, and the tail's size in bytes.
++  std::pair<uint64_t, uint64_t>
++  sparseTail() {
++    uint64_t first_level, bytes;
++    MTLTexture_sparseTail(handle, &first_level, &bytes);
++    return {first_level, bytes};
++  }
++
+   Reference<Texture>
+   newTextureView(
+       WMTPixelFormat format, WMTTextureType texture_type, uint16_t level_start, uint16_t level_count,
+@@ -723,6 +731,40 @@ public:
+   }
+ };
+ 
++// A Metal 4 queue, used only for placement sparse mapping updates.
++class MTL4CommandQueue : public Object {
++public:
++  void
++  updateTextureMappings(Texture texture, Heap heap, const WMTSparseTextureMappingOperation *ops, uint64_t count) {
++    MTL4CommandQueue_updateTextureMappings(handle, texture.handle, heap.handle, ops, count);
++  }
++
++  void
++  updateBufferMappings(Buffer buffer, Heap heap, const WMTSparseBufferMappingOperation *ops, uint64_t count) {
++    MTL4CommandQueue_updateBufferMappings(handle, buffer.handle, heap.handle, ops, count);
++  }
++
++  void
++  copyTextureMappings(Texture src, Texture dst, const WMTSparseTextureCopyOperation *ops, uint64_t count) {
++    MTL4CommandQueue_copyTextureMappings(handle, src.handle, dst.handle, ops, count);
++  }
++
++  void
++  copyBufferMappings(Buffer src, Buffer dst, const WMTSparseBufferCopyOperation *ops, uint64_t count) {
++    MTL4CommandQueue_copyBufferMappings(handle, src.handle, dst.handle, ops, count);
++  }
++
++  void
++  waitForEvent(Event event, uint64_t value) {
++    MTL4CommandQueue_waitForEvent(handle, event.handle, value);
++  }
++
++  void
++  signalEvent(Event event, uint64_t value) {
++    MTL4CommandQueue_signalEvent(handle, event.handle, value);
++  }
++};
++
+ class CommandQueue : public Object {
+ public:
+   CommandBuffer
+@@ -918,6 +960,32 @@ public:
+     return Reference<Heap>(MTLDevice_newHeap(handle, &info));
+   }
+ 
++  bool
++  supportsPlacementSparse() {
++    return MTLDevice_supportsPlacementSparse(handle);
++  }
++
++  WMTSize
++  sparseTileSize(WMTTextureType type, WMTPixelFormat format, uint32_t sample_count, WMTSparsePageSize page_size,
++                 uint64_t *out_bytes = nullptr) {
++    return MTLDevice_sparseTileSize(handle, type, format, sample_count, page_size, out_bytes);
++  }
++
++  Reference<Texture>
++  newPlacementSparseTexture(WMTTextureInfo &info, WMTSparsePageSize page_size) {
++    return Reference<Texture>(MTLDevice_newPlacementSparseTexture(handle, &info, page_size));
++  }
++
++  Reference<Buffer>
++  newPlacementSparseBuffer(WMTBufferInfo &info, WMTSparsePageSize page_size) {
++    return Reference<Buffer>(MTLDevice_newPlacementSparseBuffer(handle, &info, page_size));
++  }
++
++  Reference<MTL4CommandQueue>
++  newMTL4CommandQueue() {
++    return Reference<MTL4CommandQueue>(MTLDevice_newMTL4CommandQueue(handle));
++  }
++
+   WMTSizeAndAlign
+   heapBufferSizeAndAlign(uint64_t length, WMTResourceOptions options) {
+     return MTLDevice_heapBufferSizeAndAlign(handle, length, options);
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index 3327b29..fee631f 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -3010,6 +3010,10 @@ _MTLDevice_newHeap(void *obj) {
+   desc.sparsePageSize = (MTLSparsePageSize)info->sparse_page_size;
+   desc.type = (MTLHeapType)info->type;
+   desc.size = info->size;
++  if (info->max_compatible_placement_sparse_page_size) {
++    if (@available(macOS 26.0, *))
++      desc.maxCompatiblePlacementSparsePageSize = (MTLSparsePageSize)info->max_compatible_placement_sparse_page_size;
++  }
+ 
+   params->ret = (obj_handle_t)[device newHeapWithDescriptor:desc];
+ 
+@@ -3163,6 +3167,154 @@ NTSTATUS _CacheWriter_alloc_init(void *obj);
+ NTSTATUS _CacheWriter_set(void *obj);
+ NTSTATUS _WMTSetMetalShaderCachePath(void *obj);
+ 
++/* Placement sparse resources and the Metal 4 queue that maps their tiles (macOS 26.4+). The WMT operation
++   structs share their layout with Metal's, so arrays are passed through as they are. */
++
++_Static_assert(sizeof(struct WMTSparseTextureMappingOperation) == sizeof(MTL4UpdateSparseTextureMappingOperation), "");
++_Static_assert(sizeof(struct WMTSparseBufferMappingOperation) == sizeof(MTL4UpdateSparseBufferMappingOperation), "");
++_Static_assert(sizeof(struct WMTSparseTextureCopyOperation) == sizeof(MTL4CopySparseTextureMappingOperation), "");
++_Static_assert(sizeof(struct WMTSparseBufferCopyOperation) == sizeof(MTL4CopySparseBufferMappingOperation), "");
++
++static NTSTATUS
++_MTLDevice_supportsPlacementSparse(void *obj) {
++  struct unixcall_generic_obj_uint64_ret *params = obj;
++  id<MTLDevice> device = (id<MTLDevice>)params->handle;
++  params->ret = 0;
++  if (@available(macOS 26.4, *))
++    params->ret = [device supportsPlacementSparse];
++  return STATUS_SUCCESS;
++}
++
++static NTSTATUS
++_MTLDevice_sparseTileSize(void *obj) {
++  struct unixcall_mtldevice_sparsetilesize *params = obj;
++  id<MTLDevice> device = (id<MTLDevice>)params->device;
++  MTLSize size = [device sparseTileSizeWithTextureType:(MTLTextureType)params->type
++                                           pixelFormat:(MTLPixelFormat)params->format
++                                           sampleCount:params->sample_count
++                                        sparsePageSize:(MTLSparsePageSize)params->page_size];
++  params->ret_size.width = size.width;
++  params->ret_size.height = size.height;
++  params->ret_size.depth = size.depth;
++  params->ret_bytes = [device sparseTileSizeInBytesForSparsePageSize:(MTLSparsePageSize)params->page_size];
++  return STATUS_SUCCESS;
++}
++
++static NTSTATUS
++_MTLDevice_newPlacementSparseTexture(void *obj) {
++  struct unixcall_mtldevice_newplacementsparse *params = obj;
++  id<MTLDevice> device = (id<MTLDevice>)params->device;
++  struct WMTTextureInfo *info = params->info.ptr;
++  params->ret = 0;
++  if (@available(macOS 26.0, *)) {
++    MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
++    fill_texture_descriptor(desc, info);
++    desc.placementSparsePageSize = (MTLSparsePageSize)params->page_size;
++    id<MTLTexture> ret = [device newTextureWithDescriptor:desc];
++    params->ret = (obj_handle_t)ret;
++    info->gpu_resource_id = ret ? [ret gpuResourceID]._impl : 0;
++    info->mach_port = 0;
++    [desc release];
++  }
++  return STATUS_SUCCESS;
++}
++
++static NTSTATUS
++_MTLDevice_newPlacementSparseBuffer(void *obj) {
++  struct unixcall_mtldevice_newplacementsparse *params = obj;
++  id<MTLDevice> device = (id<MTLDevice>)params->device;
++  struct WMTBufferInfo *info = params->info.ptr;
++  params->ret = 0;
++  if (@available(macOS 26.0, *)) {
++    id<MTLBuffer> ret = [device newBufferWithLength:info->length
++                                            options:(MTLResourceOptions)info->options
++                            placementSparsePageSize:(MTLSparsePageSize)params->page_size];
++    params->ret = (obj_handle_t)ret;
++    info->gpu_address = ret ? [ret gpuAddress] : 0;
++    info->memory.ptr = NULL;
++  }
++  return STATUS_SUCCESS;
++}
++
++static NTSTATUS
++_MTLTexture_sparseTail(void *obj) {
++  struct unixcall_mtltexture_sparsetail *params = obj;
++  id<MTLTexture> texture = (id<MTLTexture>)params->texture;
++  params->ret_first_level = [texture firstMipmapInTail];
++  params->ret_bytes = [texture tailSizeInBytes];
++  return STATUS_SUCCESS;
++}
++
++static NTSTATUS
++_MTLDevice_newMTL4CommandQueue(void *obj) {
++  struct unixcall_generic_obj_obj_ret *params = obj;
++  id<MTLDevice> device = (id<MTLDevice>)params->handle;
++  params->ret = 0;
++  if (@available(macOS 26.0, *))
++    params->ret = (obj_handle_t)[device newMTL4CommandQueue];
++  return STATUS_SUCCESS;
++}
++
++static NTSTATUS
++_MTL4CommandQueue_updateTextureMappings(void *obj) {
++  struct unixcall_mtl4commandqueue_sparseop *params = obj;
++  if (@available(macOS 26.0, *))
++    [(id<MTL4CommandQueue>)params->queue updateTextureMappings:(id<MTLTexture>)params->resource
++                                                          heap:(id<MTLHeap>)params->heap
++                                                    operations:(const MTL4UpdateSparseTextureMappingOperation *)params->ops.ptr
++                                                         count:params->count];
++  return STATUS_SUCCESS;
++}
++
++static NTSTATUS
++_MTL4CommandQueue_updateBufferMappings(void *obj) {
++  struct unixcall_mtl4commandqueue_sparseop *params = obj;
++  if (@available(macOS 26.0, *))
++    [(id<MTL4CommandQueue>)params->queue updateBufferMappings:(id<MTLBuffer>)params->resource
++                                                         heap:(id<MTLHeap>)params->heap
++                                                   operations:(const MTL4UpdateSparseBufferMappingOperation *)params->ops.ptr
++                                                        count:params->count];
++  return STATUS_SUCCESS;
++}
++
++static NTSTATUS
++_MTL4CommandQueue_copyTextureMappings(void *obj) {
++  struct unixcall_mtl4commandqueue_sparseop *params = obj;
++  if (@available(macOS 26.0, *))
++    [(id<MTL4CommandQueue>)params->queue copyTextureMappingsFromTexture:(id<MTLTexture>)params->resource
++                                                              toTexture:(id<MTLTexture>)params->heap
++                                                             operations:(const MTL4CopySparseTextureMappingOperation *)params->ops.ptr
++                                                                  count:params->count];
++  return STATUS_SUCCESS;
++}
++
++static NTSTATUS
++_MTL4CommandQueue_copyBufferMappings(void *obj) {
++  struct unixcall_mtl4commandqueue_sparseop *params = obj;
++  if (@available(macOS 26.0, *))
++    [(id<MTL4CommandQueue>)params->queue copyBufferMappingsFromBuffer:(id<MTLBuffer>)params->resource
++                                                             toBuffer:(id<MTLBuffer>)params->heap
++                                                           operations:(const MTL4CopySparseBufferMappingOperation *)params->ops.ptr
++                                                                count:params->count];
++  return STATUS_SUCCESS;
++}
++
++static NTSTATUS
++_MTL4CommandQueue_waitForEvent(void *obj) {
++  struct unixcall_generic_obj_obj_uint64_noret *params = obj;
++  if (@available(macOS 26.0, *))
++    [(id<MTL4CommandQueue>)params->handle waitForEvent:(id<MTLEvent>)params->arg0 value:params->arg1];
++  return STATUS_SUCCESS;
++}
++
++static NTSTATUS
++_MTL4CommandQueue_signalEvent(void *obj) {
++  struct unixcall_generic_obj_obj_uint64_noret *params = obj;
++  if (@available(macOS 26.0, *))
++    [(id<MTL4CommandQueue>)params->handle signalEvent:(id<MTLEvent>)params->arg0 value:params->arg1];
++  return STATUS_SUCCESS;
++}
++
+ const void *__wine_unix_call_funcs[] = {
+     &_NSObject_retain,
+     &_NSObject_release,
+@@ -3310,6 +3462,18 @@ const void *__wine_unix_call_funcs[] = {
+     &_MTLDevice_newIndirectCommandBuffer,
+     &_MTLDevice_newLibraryWithSource,
+     &_MTLTexture_getBytes,
++    &_MTLDevice_supportsPlacementSparse,
++    &_MTLDevice_sparseTileSize,
++    &_MTLDevice_newPlacementSparseTexture,
++    &_MTLDevice_newPlacementSparseBuffer,
++    &_MTLTexture_sparseTail,
++    &_MTLDevice_newMTL4CommandQueue,
++    &_MTL4CommandQueue_updateTextureMappings,
++    &_MTL4CommandQueue_updateBufferMappings,
++    &_MTL4CommandQueue_copyTextureMappings,
++    &_MTL4CommandQueue_copyBufferMappings,
++    &_MTL4CommandQueue_waitForEvent,
++    &_MTL4CommandQueue_signalEvent,
+ };
+ 
+ #ifndef DXMT_NATIVE
+@@ -3460,5 +3624,17 @@ const void *__wine_unix_call_wow64_funcs[] = {
+     &_MTLDevice_newIndirectCommandBuffer,
+     &_MTLDevice_newLibraryWithSource,
+     &_MTLTexture_getBytes,
++    &_MTLDevice_supportsPlacementSparse,
++    &_MTLDevice_sparseTileSize,
++    &_MTLDevice_newPlacementSparseTexture,
++    &_MTLDevice_newPlacementSparseBuffer,
++    &_MTLTexture_sparseTail,
++    &_MTLDevice_newMTL4CommandQueue,
++    &_MTL4CommandQueue_updateTextureMappings,
++    &_MTL4CommandQueue_updateBufferMappings,
++    &_MTL4CommandQueue_copyTextureMappings,
++    &_MTL4CommandQueue_copyBufferMappings,
++    &_MTL4CommandQueue_waitForEvent,
++    &_MTL4CommandQueue_signalEvent,
+ };
+ #endif
+diff --git a/src/winemetal/winemetal.h b/src/winemetal/winemetal.h
+index 97fffc7..ec1f212 100644
+--- a/src/winemetal/winemetal.h
++++ b/src/winemetal/winemetal.h
+@@ -2078,9 +2078,12 @@ struct WMTHeapInfo {
+   enum WMTResourceOptions options;
+   enum WMTHeapType type;
+   enum WMTSparsePageSize sparse_page_size;
++  // placement heaps: the largest placement-sparse page size the heap can back (0 for none)
++  enum WMTSparsePageSize max_compatible_placement_sparse_page_size;
++  uint32_t reserved;
+ };
+ 
+-STATIC_ASSERT(sizeof(WMTHeapInfo) == 24);
++STATIC_ASSERT(sizeof(WMTHeapInfo) == 32);
+ 
+ WINEMETAL_API obj_handle_t MTLDevice_newHeap(obj_handle_t device, const struct WMTHeapInfo *info);
+ 
+@@ -2148,4 +2151,95 @@ WINEMETAL_API void MTLTexture_getBytes(
+     struct WMTMemoryPointer data, uint64_t bytes_per_row, uint64_t bytes_per_image
+ );
+ 
++/* Placement sparse resources (macOS 26.4+): resources without memory of their own, whose tiles are mapped to
++   pages of placement heaps through a Metal 4 command queue. The operation structs match Metal's on 64-bit. */
++
++enum WMTSparseMappingMode : uint64_t {
++  WMTSparseMappingModeMap = 0,
++  WMTSparseMappingModeUnmap = 1,
++};
++
++struct WMTSparseTextureMappingOperation {
++  enum WMTSparseMappingMode mode;
++  struct WMTOrigin origin; // in tiles
++  struct WMTSize size;     // in tiles
++  uint64_t level;
++  uint64_t slice;
++  uint64_t heap_offset; // in tiles
++};
++
++STATIC_ASSERT(sizeof(WMTSparseTextureMappingOperation) == 80);
++
++struct WMTSparseBufferMappingOperation {
++  enum WMTSparseMappingMode mode;
++  uint64_t location; // in tiles
++  uint64_t length;   // in tiles
++  uint64_t heap_offset; // in tiles
++};
++
++STATIC_ASSERT(sizeof(WMTSparseBufferMappingOperation) == 32);
++
++struct WMTSparseTextureCopyOperation {
++  struct WMTOrigin src_origin; // in tiles
++  struct WMTSize src_size;     // in tiles
++  uint64_t src_level;
++  uint64_t src_slice;
++  struct WMTOrigin dst_origin; // in tiles
++  uint64_t dst_level;
++  uint64_t dst_slice;
++};
++
++STATIC_ASSERT(sizeof(WMTSparseTextureCopyOperation) == 104);
++
++struct WMTSparseBufferCopyOperation {
++  uint64_t src_location; // in tiles
++  uint64_t src_length;   // in tiles
++  uint64_t dst_location; // in tiles
++};
++
++STATIC_ASSERT(sizeof(WMTSparseBufferCopyOperation) == 24);
++
++WINEMETAL_API bool MTLDevice_supportsPlacementSparse(obj_handle_t device);
++
++// Tile size in pixels (or blocks) for a texture layout, and in bytes for the page size.
++WINEMETAL_API struct WMTSize MTLDevice_sparseTileSize(
++    obj_handle_t device, enum WMTTextureType type, enum WMTPixelFormat format, uint32_t sample_count,
++    enum WMTSparsePageSize page_size, uint64_t *out_bytes
++);
++
++WINEMETAL_API obj_handle_t
++MTLDevice_newPlacementSparseTexture(obj_handle_t device, struct WMTTextureInfo *info, enum WMTSparsePageSize page_size);
++
++WINEMETAL_API obj_handle_t
++MTLDevice_newPlacementSparseBuffer(obj_handle_t device, struct WMTBufferInfo *info, enum WMTSparsePageSize page_size);
++
++// First mip level of the packed tail and the tail's size in bytes.
++WINEMETAL_API void MTLTexture_sparseTail(obj_handle_t texture, uint64_t *out_first_level, uint64_t *out_bytes);
++
++WINEMETAL_API obj_handle_t MTLDevice_newMTL4CommandQueue(obj_handle_t device);
++
++WINEMETAL_API void MTL4CommandQueue_updateTextureMappings(
++    obj_handle_t queue, obj_handle_t texture, obj_handle_t heap, const struct WMTSparseTextureMappingOperation *ops,
++    uint64_t count
++);
++
++WINEMETAL_API void MTL4CommandQueue_updateBufferMappings(
++    obj_handle_t queue, obj_handle_t buffer, obj_handle_t heap, const struct WMTSparseBufferMappingOperation *ops,
++    uint64_t count
++);
++
++WINEMETAL_API void MTL4CommandQueue_copyTextureMappings(
++    obj_handle_t queue, obj_handle_t src, obj_handle_t dst, const struct WMTSparseTextureCopyOperation *ops,
++    uint64_t count
++);
++
++WINEMETAL_API void MTL4CommandQueue_copyBufferMappings(
++    obj_handle_t queue, obj_handle_t src, obj_handle_t dst, const struct WMTSparseBufferCopyOperation *ops,
++    uint64_t count
++);
++
++WINEMETAL_API void MTL4CommandQueue_waitForEvent(obj_handle_t queue, obj_handle_t event, uint64_t value);
++
++WINEMETAL_API void MTL4CommandQueue_signalEvent(obj_handle_t queue, obj_handle_t event, uint64_t value);
++
+ #endif
+\ No newline at end of file
+diff --git a/src/winemetal/winemetal_thunks.c b/src/winemetal/winemetal_thunks.c
+index 42286c9..29194cd 100644
+--- a/src/winemetal/winemetal_thunks.c
++++ b/src/winemetal/winemetal_thunks.c
+@@ -1331,3 +1331,134 @@ MTLTexture_getBytes(
+   params.bytes_per_image = bytes_per_image;
+   UNIX_CALL(145, &params);
+ }
++
++WINEMETAL_API bool
++MTLDevice_supportsPlacementSparse(obj_handle_t device) {
++  struct unixcall_generic_obj_uint64_ret params;
++  params.handle = device;
++  params.ret = 0;
++  UNIX_CALL(146, &params);
++  return params.ret;
++}
++
++WINEMETAL_API struct WMTSize
++MTLDevice_sparseTileSize(
++    obj_handle_t device, enum WMTTextureType type, enum WMTPixelFormat format, uint32_t sample_count,
++    enum WMTSparsePageSize page_size, uint64_t *out_bytes
++) {
++  struct unixcall_mtldevice_sparsetilesize params;
++  params.device = device;
++  params.type = type;
++  params.format = format;
++  params.sample_count = sample_count;
++  params.page_size = page_size;
++  params.ret_size.width = params.ret_size.height = params.ret_size.depth = 0;
++  params.ret_bytes = 0;
++  UNIX_CALL(147, &params);
++  if (out_bytes)
++    *out_bytes = params.ret_bytes;
++  return params.ret_size;
++}
++
++WINEMETAL_API obj_handle_t
++MTLDevice_newPlacementSparseTexture(obj_handle_t device, struct WMTTextureInfo *info, enum WMTSparsePageSize page_size) {
++  struct unixcall_mtldevice_newplacementsparse params;
++  params.device = device;
++  WMT_MEMPTR_SET(params.info, info);
++  params.page_size = page_size;
++  params.ret = 0;
++  UNIX_CALL(148, &params);
++  return params.ret;
++}
++
++WINEMETAL_API obj_handle_t
++MTLDevice_newPlacementSparseBuffer(obj_handle_t device, struct WMTBufferInfo *info, enum WMTSparsePageSize page_size) {
++  struct unixcall_mtldevice_newplacementsparse params;
++  params.device = device;
++  WMT_MEMPTR_SET(params.info, info);
++  params.page_size = page_size;
++  params.ret = 0;
++  UNIX_CALL(149, &params);
++  return params.ret;
++}
++
++WINEMETAL_API void
++MTLTexture_sparseTail(obj_handle_t texture, uint64_t *out_first_level, uint64_t *out_bytes) {
++  struct unixcall_mtltexture_sparsetail params;
++  params.texture = texture;
++  params.ret_first_level = 0;
++  params.ret_bytes = 0;
++  UNIX_CALL(150, &params);
++  *out_first_level = params.ret_first_level;
++  *out_bytes = params.ret_bytes;
++}
++
++WINEMETAL_API obj_handle_t
++MTLDevice_newMTL4CommandQueue(obj_handle_t device) {
++  struct unixcall_generic_obj_obj_ret params;
++  params.handle = device;
++  params.ret = 0;
++  UNIX_CALL(151, &params);
++  return params.ret;
++}
++
++static void
++mtl4_sparse_op(unsigned code, obj_handle_t queue, obj_handle_t a, obj_handle_t b, const void *ops, uint64_t count) {
++  struct unixcall_mtl4commandqueue_sparseop params;
++  params.queue = queue;
++  params.resource = a;
++  params.heap = b;
++  WMT_MEMPTR_SET(params.ops, ops);
++  params.count = count;
++  UNIX_CALL(code, &params);
++}
++
++WINEMETAL_API void
++MTL4CommandQueue_updateTextureMappings(
++    obj_handle_t queue, obj_handle_t texture, obj_handle_t heap, const struct WMTSparseTextureMappingOperation *ops,
++    uint64_t count
++) {
++  mtl4_sparse_op(152, queue, texture, heap, ops, count);
++}
++
++WINEMETAL_API void
++MTL4CommandQueue_updateBufferMappings(
++    obj_handle_t queue, obj_handle_t buffer, obj_handle_t heap, const struct WMTSparseBufferMappingOperation *ops,
++    uint64_t count
++) {
++  mtl4_sparse_op(153, queue, buffer, heap, ops, count);
++}
++
++WINEMETAL_API void
++MTL4CommandQueue_copyTextureMappings(
++    obj_handle_t queue, obj_handle_t src, obj_handle_t dst, const struct WMTSparseTextureCopyOperation *ops,
++    uint64_t count
++) {
++  mtl4_sparse_op(154, queue, src, dst, ops, count);
++}
++
++WINEMETAL_API void
++MTL4CommandQueue_copyBufferMappings(
++    obj_handle_t queue, obj_handle_t src, obj_handle_t dst, const struct WMTSparseBufferCopyOperation *ops,
++    uint64_t count
++) {
++  mtl4_sparse_op(155, queue, src, dst, ops, count);
++}
++
++WINEMETAL_API void
++MTL4CommandQueue_waitForEvent(obj_handle_t queue, obj_handle_t event, uint64_t value) {
++  struct unixcall_generic_obj_obj_uint64_noret params;
++  params.handle = queue;
++  params.arg0 = event;
++  params.arg1 = value;
++  UNIX_CALL(156, &params);
++}
++
++WINEMETAL_API void
++MTL4CommandQueue_signalEvent(obj_handle_t queue, obj_handle_t event, uint64_t value) {
++  struct unixcall_generic_obj_obj_uint64_noret params;
++  params.handle = queue;
++  params.arg0 = event;
++  params.arg1 = value;
++  UNIX_CALL(157, &params);
++}
+diff --git a/src/winemetal/winemetal_thunks.h b/src/winemetal/winemetal_thunks.h
+index 37645c9..b186b29 100644
+--- a/src/winemetal/winemetal_thunks.h
++++ b/src/winemetal/winemetal_thunks.h
+@@ -435,6 +435,37 @@ struct unixcall_mtldevice_newicb {
+   obj_handle_t ret;
+ };
+ 
++struct unixcall_mtldevice_sparsetilesize {
++  obj_handle_t device;
++  uint32_t type;
++  uint32_t format;
++  uint32_t sample_count;
++  uint32_t page_size;
++  struct WMTSize ret_size;
++  uint64_t ret_bytes;
++};
++
++struct unixcall_mtldevice_newplacementsparse {
++  obj_handle_t device;
++  struct WMTMemoryPointer info;
++  uint64_t page_size;
++  obj_handle_t ret;
++};
++
++struct unixcall_mtltexture_sparsetail {
++  obj_handle_t texture;
++  uint64_t ret_first_level;
++  uint64_t ret_bytes;
++};
++
++struct unixcall_mtl4commandqueue_sparseop {
++  obj_handle_t queue;
++  obj_handle_t resource;  // or the copy source
++  obj_handle_t heap;      // or the copy destination
++  struct WMTConstMemoryPointer ops;
++  uint64_t count;
++};
++
+ #pragma pack(pop)
+ 
+ #endif
+-- 
+2.50.1 (Apple Git-155)
+
