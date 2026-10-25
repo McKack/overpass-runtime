@@ -1,0 +1,378 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 00:35:32 +0100
+Subject: [PATCH] airconv: SV_Barycentrics and GetAttributeAtVertex
+
+SV_Barycentrics maps to [[barycentric_coord]] and gets a register after the packed inputs.
+GetAttributeAtVertex on float inputs: the input is read without perspective (pull mode) together with
+no-perspective barycentrics; both are affine in screen space, so value and screen derivatives give three
+equations for the three vertex values, solved in the prologue. Works on all Metal 3 GPUs (vertex_value<T>
+compiles on Apple9 but returns wrong data). Integer and half inputs get the flat value for every vertex.
+---
+ src/airconv/air_signature.cpp          | 13 ++++++
+ src/airconv/air_signature.hpp          |  6 ++-
+ src/airconv/dxil_converter.cpp         | 62 +++++++++++++++++++++++++-
+ src/airconv/dxil_metadata.hpp          |  3 ++
+ src/airconv/nt/dxbc_io_helper.cpp      | 51 ++++++++++++++++++++-
+ src/airconv/nt/dxbc_io_helper.hpp      |  9 ++++
+ src/airconv/nt/dxil_converter_base.cpp | 28 +++++++++---
+ src/airconv/nt/dxil_converter_base.hpp |  2 +-
+ 8 files changed, 164 insertions(+), 10 deletions(-)
+
+diff --git a/src/airconv/air_signature.cpp b/src/airconv/air_signature.cpp
+index 6bba459..1954d1d 100644
+--- a/src/airconv/air_signature.cpp
++++ b/src/airconv/air_signature.cpp
+@@ -454,6 +454,10 @@ uint32_t FunctionSignatureBuilder::DefineInput(const FunctionInput &input) {
+                 return s.user ==
+                        std::get<InputFragmentStageIn>(element.value()).user;
+               },
++              [&](const InputBarycentricCoord s) {
++                return s.interpolation ==
++                       std::get<InputBarycentricCoord>(element.value()).interpolation;
++              },
+               [&](const ArgumentBindingBuffer s) {
+                 return s.location_index ==
+                        std::get<ArgumentBindingBuffer>(element.value())
+@@ -696,6 +700,15 @@ auto FunctionSignatureBuilder::CreateFunction(
+ 
+           return msl_float4.get_llvm_type(context);
+         },
++        [&](const InputBarycentricCoord &barycentric) {
++          metadata_field.string("air.barycentric_coord");
++          insert_inteterpolation(metadata_field, barycentric.interpolation, false);
++          metadata_field.string("air.arg_type_name")
++            ->string("float3")
++            ->string("air.arg_name")
++            ->string("mtl_barycentric_coord");
++          return msl_float3.get_llvm_type(context);
++        },
+         [&](const InputFrontFacing &) {
+           metadata_field.string("air.front_facing")
+             ->string("air.arg_type_name")
+diff --git a/src/airconv/air_signature.hpp b/src/airconv/air_signature.hpp
+index a050f2c..b117801 100644
+--- a/src/airconv/air_signature.hpp
++++ b/src/airconv/air_signature.hpp
+@@ -518,6 +518,10 @@ struct InputFragmentStageIn {
+   bool pull_mode;
+ };
+ 
++struct InputBarycentricCoord {
++  Interpolation interpolation;
++};
++
+ struct InputVertexID {};
+ struct InputBaseVertex {};
+ struct InputInstanceID {};
+@@ -610,7 +614,7 @@ using FunctionInput = template_concat_t<
+     /* fragment */
+     InputPrimitiveID, InputViewportArrayIndex, InputRenderTargetArrayIndex,
+     InputFrontFacing, InputPosition, InputSampleIndex, //
+-    InputFragmentStageIn, InputInputCoverage,
++    InputFragmentStageIn, InputInputCoverage, InputBarycentricCoord,
+     /* object & mesh */
+     InputPayload, InputMeshGridProperties, InputMesh,
+     /* kernel */
+diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
+index 17e98e6..61da07f 100644
+--- a/src/airconv/dxil_converter.cpp
++++ b/src/airconv/dxil_converter.cpp
+@@ -11,6 +11,7 @@
+ #include "nt/dxil_converter_base.hpp"
+ 
+ #include <memory>
++#include <set>
+ #include <string>
+ #include <utility>
+ 
+@@ -399,9 +400,35 @@ llvm::Error
+ initialize_pixel_signature(dxmt::dxbc::SM50ShaderInternal *shader) {
+   using namespace dxmt::dxbc;
+ 
+-  const EntryPoint &entry = shader->dxil_entry;
++  EntryPoint &entry = shader->dxil_entry;
+   uint32_t input_count = (uint32_t)entry.inputs.size();
+   uint32_t max_input_register = 0;
++
++  /* SV_Barycentrics has no register of its own, and inputs read with GetAttributeAtVertex need three more each:
++     give them registers after the packed ones. */
++  uint32_t free_register = 0;
++  for (auto &element : entry.inputs)
++    if (element.start_row >= 0)
++      free_register = std::max(free_register, (uint32_t)element.start_row + element.rows);
++  std::set<uint32_t> per_vertex_elements;
++  if (entry.function)
++    for (auto &block : *entry.function)
++      for (auto &inst : block)
++        if (auto call = llvm::dyn_cast<llvm::CallInst>(&inst))
++          if (auto callee = call->getCalledFunction(); callee && callee->getName().startswith("dx.op.attributeAtVertex"))
++            if (auto id = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1)))
++              per_vertex_elements.insert((uint32_t)id->getZExtValue());
++  for (auto &element : entry.inputs) {
++    if (element.semantic_kind == SemanticKind::Barycentrics) {
++      element.start_row = (int32_t)free_register++;
++      element.start_col = 0;
++    } else if (per_vertex_elements.count(element.id) && element.start_row >= 0) {
++      element.vertex_row = (int32_t)free_register;
++      free_register += 3 * element.rows;
++    }
++  }
++  max_input_register = free_register;
++
+   for (uint32_t i = 0; i < input_count; ++i) {
+     const auto &element = entry.inputs[i];
+ 
+@@ -420,7 +447,6 @@ initialize_pixel_signature(dxmt::dxbc::SM50ShaderInternal *shader) {
+       return unsupported("dxil: unsupported pixel shader input layout");
+     uint32_t reg = (uint32_t)element.start_row;
+     uint32_t mask = element_register_mask(element);
+-    max_input_register = std::max(max_input_register, reg + element.rows);
+ 
+     switch (element.semantic_kind) {
+     case SemanticKind::Position: {
+@@ -444,17 +470,49 @@ initialize_pixel_signature(dxmt::dxbc::SM50ShaderInternal *shader) {
+         auto user = element_attribute_name(element, row);
+         if (auto err = user.takeError())
+           return err;
++        int32_t vertex_reg = element.vertex_row < 0 ? -1 : element.vertex_row + (int32_t)row * 3;
++        bool solve = vertex_reg >= 0 && element.component_type == ComponentType::F32;
+         shader->signature_handlers.push_back([=, user = *user, reg = reg + row](SignatureContext &ctx) {
++          if (solve) {
++            uint32_t arg = ctx.func_signature.DefineInput(
++                air::InputFragmentStageIn{
++                    .user = user, .type = *msl_type, .interpolation = Interpolation::center_no_perspective,
++                    .pull_mode = true
++                }
++            );
++            uint32_t barycentric = ctx.func_signature.DefineInput(
++                air::InputBarycentricCoord{.interpolation = Interpolation::center_no_perspective}
++            );
++            ctx.prologue.Add([=](IOHelper &io) -> llvm::Error {
++              return io.InitializePerVertexInput(arg, barycentric, reg, mask, vertex_reg);
++            });
++            return;
++          }
+           uint32_t arg = ctx.func_signature.DefineInput(
+               air::InputFragmentStageIn{
+                   .user = user, .type = *msl_type, .interpolation = *interpolation, .pull_mode = false
+               }
+           );
+           ctx.prologue.Add([=](IOHelper &io) -> llvm::Error { return io.InitializeInput(arg, reg, mask); });
++          /* Integer and half values can't be recovered by interpolation: every vertex gets the flat value. */
++          for (int32_t vertex = 0; vertex_reg >= 0 && vertex < 3; vertex++)
++            ctx.prologue.Add([=](IOHelper &io) -> llvm::Error {
++              return io.InitializeInput(arg, vertex_reg + vertex, mask);
++            });
+         });
+       }
+       break;
+     }
++    case SemanticKind::Barycentrics: {
++      auto interpolation = to_air_interpolation(element.interpolation);
++      if (!interpolation || *interpolation == Interpolation::flat)
++        return unsupported("dxil: unsupported interpolation mode");
++      shader->signature_handlers.push_back([=](SignatureContext &ctx) {
++        uint32_t arg = ctx.func_signature.DefineInput(air::InputBarycentricCoord{.interpolation = *interpolation});
++        ctx.prologue.Add([=](IOHelper &io) -> llvm::Error { return io.InitializeInput(arg, reg, 0b0111); });
++      });
++      break;
++    }
+     case SemanticKind::IsFrontFace: {
+       shader->signature_handlers.push_back([=](SignatureContext &ctx) {
+         uint32_t arg = ctx.func_signature.DefineInput(air::InputFrontFacing{});
+diff --git a/src/airconv/dxil_metadata.hpp b/src/airconv/dxil_metadata.hpp
+index 604c607..ff37709 100644
+--- a/src/airconv/dxil_metadata.hpp
++++ b/src/airconv/dxil_metadata.hpp
+@@ -175,6 +175,9 @@ struct SignatureElement {
+   int32_t start_row = 0;
+   int32_t start_col = 0;
+   uint32_t usage_mask = 0;
++  /* Pixel shader inputs read with GetAttributeAtVertex: first of the 3 * rows registers holding each vertex's
++     value (row r, vertex v at vertex_row + r * 3 + v); -1 otherwise. */
++  int32_t vertex_row = -1;
+ };
+ 
+ enum class EntryPropertyTag : uint32_t {
+diff --git a/src/airconv/nt/dxbc_io_helper.cpp b/src/airconv/nt/dxbc_io_helper.cpp
+index bf356cf..4359832 100644
+--- a/src/airconv/nt/dxbc_io_helper.cpp
++++ b/src/airconv/nt/dxbc_io_helper.cpp
+@@ -123,7 +123,56 @@ IOHelper::StoreAtVec4ArrayMasked(llvm::Value *array, llvm::Value *index, llvm::V
+ 
+ llvm::Error
+ IOHelper::InitializeInput(uint32_t with_fnarg_at, uint32_t to_reg, uint32_t mask, bool fix_w_component) {
+-  llvm::Value *arg = function->getArg(with_fnarg_at);
++  return InitializeInputValue(function->getArg(with_fnarg_at), to_reg, mask, fix_w_component);
++}
++
++llvm::Error
++IOHelper::InitializePerVertexInput(
++    uint32_t with_interpolant_at, uint32_t with_barycentric_at, uint32_t to_reg, uint32_t mask,
++    uint32_t first_vertex_reg
++) {
++  /* Metal before Apple10 GPUs has no per-vertex fragment inputs. The value interpolated without perspective, L,
++     and the barycentric weights b (also without perspective) are both affine in screen space, so with their
++     screen derivatives they give three equations for the three vertex values a:
++       b . a = L,   ddx(b) . a = ddx(L),   ddy(b) . a = ddy(L)
++     Solved with the inverse through cross products: rows R0 = b, R1 = ddx(b), R2 = ddy(b); columns of the
++     adjugate C0 = R1 x R2, C1 = R2 x R0, C2 = R0 x R1; a_k = (C0[k] L + C1[k] ddx(L) + C2[k] ddy(L)) / det. */
++  auto L = air.CreateInterpolateAtCenter(function->getArg(with_interpolant_at), false);
++  auto Lx = air.CreateDerivative(L, false), Ly = air.CreateDerivative(L, true);
++  llvm::Value *b = function->getArg(with_barycentric_at);
++  llvm::Value *rows[3] = {b, air.CreateDerivative(b, false), air.CreateDerivative(b, true)};
++  auto element = [&](llvm::Value *v, unsigned i) { return ir.CreateExtractElement(v, i); };
++  auto cross = [&](llvm::Value *u, llvm::Value *v, unsigned k) {
++    unsigned i = (k + 1) % 3, j = (k + 2) % 3;
++    return ir.CreateFSub(ir.CreateFMul(element(u, i), element(v, j)), ir.CreateFMul(element(u, j), element(v, i)));
++  };
++  llvm::Value *det = nullptr;
++  for (unsigned k = 0; k < 3; k++) {
++    auto term = ir.CreateFMul(element(rows[0], k), cross(rows[1], rows[2], k));
++    det = det ? ir.CreateFAdd(det, term) : term;
++  }
++  auto rcp_det = ir.CreateFDiv(air.getFloat(1.0f), det);
++  auto splat = [&](llvm::Value *s) { return ir.CreateVectorSplat(4, s); };
++  for (uint32_t vertex = 0; vertex < 3; vertex++) {
++    auto value = ir.CreateFAdd(
++        ir.CreateFAdd(
++            ir.CreateFMul(splat(cross(rows[1], rows[2], vertex)), L), ir.CreateFMul(splat(cross(rows[2], rows[0], vertex)), Lx)
++        ),
++        ir.CreateFMul(splat(cross(rows[0], rows[1], vertex)), Ly)
++    );
++    value = ir.CreateFMul(value, splat(rcp_det));
++    if (auto err = InitializeInputValue(value, first_vertex_reg + vertex, mask, false))
++      return err;
++    /* The register itself holds the first (provoking) vertex's value, like flat interpolation. */
++    if (vertex == 0)
++      if (auto err = InitializeInputValue(value, to_reg, mask, false))
++        return err;
++  }
++  return llvm::Error::success();
++}
++
++llvm::Error
++IOHelper::InitializeInputValue(llvm::Value *arg, uint32_t to_reg, uint32_t mask, bool fix_w_component) {
+ 
+   auto ToInt32 = [this](llvm::Value *Value) -> llvm::Expected<llvm::Value *> {
+     if (Value->getType()->getScalarType() == types._int)
+diff --git a/src/airconv/nt/dxbc_io_helper.hpp b/src/airconv/nt/dxbc_io_helper.hpp
+index 2c8fcda..c4e965c 100644
+--- a/src/airconv/nt/dxbc_io_helper.hpp
++++ b/src/airconv/nt/dxbc_io_helper.hpp
+@@ -23,6 +23,15 @@ public:
+       uint32_t FromFunctionArgumentIndex, uint32_t ToRegister, uint32_t Mask, bool InvertWComponent = false
+   );
+ 
++  llvm::Error InitializeInputValue(llvm::Value *Value, uint32_t ToRegister, uint32_t Mask, bool InvertWComponent);
++
++  /* An input read with GetAttributeAtVertex, from its no-perspective interpolant and no-perspective barycentrics:
++     vertex k goes to FirstVertexRegister + k, the first vertex also to ToRegister. */
++  llvm::Error InitializePerVertexInput(
++      uint32_t InterpolantArgumentIndex, uint32_t BarycentricArgumentIndex, uint32_t ToRegister, uint32_t Mask,
++      uint32_t FirstVertexRegister
++  );
++
+   llvm::Error InitializeInterpolatedInput(
+       uint32_t FromFunctionArgumentIndex, uint32_t ToRegister, uint32_t Mask,
+       air::Interpolation Interpolation, uint32_t AtSampleIndex
+diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
+index 0722000..973a89b 100644
+--- a/src/airconv/nt/dxil_converter_base.cpp
++++ b/src/airconv/nt/dxil_converter_base.cpp
+@@ -834,6 +834,8 @@ Converter::EmitDxilOp(CallInst &Call) {
+     return EmitBarrier(Call);
+   if (op == "loadInput")
+     return EmitLoadInput(Call);
++  if (op == "attributeAtVertex")
++    return EmitLoadInput(Call, true);
+   if (op == "storeOutput")
+     return EmitStoreOutput(Call);
+   if (op == "sample" || op == "sampleLevel" || op == "sampleBias" || op == "sampleCmp" || op == "sampleCmpLevelZero" ||
+@@ -1499,7 +1501,7 @@ Converter::EmitBarrier(CallInst &Call) {
+ }
+ 
+ llvm::Expected<llvm::Value *>
+-Converter::EmitLoadInput(const CallInst &Call) {
++Converter::EmitLoadInput(const CallInst &Call, bool AtVertex) {
+   auto Element = asU32(Call.getArgOperand(1));
+   auto Row = asU32(Call.getArgOperand(2));
+   auto Component = asU32(Call.getArgOperand(3));
+@@ -1522,6 +1524,7 @@ Converter::EmitLoadInput(const CallInst &Call) {
+   case SemanticKind::ViewPortArrayIndex:
+   case SemanticKind::ClipDistance:
+   case SemanticKind::CullDistance:
++  case SemanticKind::Barycentrics:
+     break;
+   default:
+     return unsupported("dxil: unsupported loadInput semantic " + std::to_string((uint32_t)signature.semantic_kind));
+@@ -1532,11 +1535,26 @@ Converter::EmitLoadInput(const CallInst &Call) {
+   uint32_t Lane = (uint32_t)signature.start_col + *Component;
+   if (Lane > 3)
+     return unsupported("dxil: loadInput component out of range");
++  llvm::Value *RegIndex = ir.getInt32(Reg);
++  if (AtVertex) {
++    // attributeAtVertex(inputSigId, row, col, vertexID): the prologue put each vertex's value in its own register.
++    if (signature.vertex_row < 0)
++      return unsupported("dxil: attributeAtVertex on an input without per-vertex values");
++    uint32_t First = (uint32_t)signature.vertex_row + *Row * 3;
++    if (auto Constant = dyn_cast<ConstantInt>(Call.getArgOperand(4))) {
++      RegIndex = ir.getInt32(First + (uint32_t)Constant->getZExtValue());
++    } else {
++      auto Vertex = Get(Call.getArgOperand(4));
++      if (!Vertex)
++        return Vertex.takeError();
++      RegIndex = ir.CreateAdd(ir.getInt32(First), ir.CreateZExtOrTrunc(*Vertex, ir.getInt32Ty()));
++    }
++  }
+ 
+   if (Type->isIntegerTy()) {
+     auto *Ptr = ir.CreateGEP(
+         ctx.resource.input.ptr_int4->getType()->getNonOpaquePointerElementType(), ctx.resource.input.ptr_int4,
+-        {ir.getInt32(0), ir.getInt32(Reg), ir.getInt32(Lane)}
++        {ir.getInt32(0), RegIndex, ir.getInt32(Lane)}
+     );
+     auto *Value = ir.CreateLoad(ir.getInt32Ty(), Ptr);
+     if (Type->getIntegerBitWidth() < 32)
+@@ -1548,7 +1566,7 @@ Converter::EmitLoadInput(const CallInst &Call) {
+   if (Type->isFloatTy()) {
+     auto *Ptr = ir.CreateGEP(
+         ctx.resource.input.ptr_float4->getType()->getNonOpaquePointerElementType(), ctx.resource.input.ptr_float4,
+-        {ir.getInt32(0), ir.getInt32(Reg), ir.getInt32(Lane)}
++        {ir.getInt32(0), RegIndex, ir.getInt32(Lane)}
+     );
+     return ir.CreateLoad(ir.getFloatTy(), Ptr);
+   }
+@@ -1556,13 +1574,13 @@ Converter::EmitLoadInput(const CallInst &Call) {
+     if (signature.semantic_kind == SemanticKind::Position) {
+       auto *Ptr = ir.CreateGEP(
+           ctx.resource.input.ptr_float4->getType()->getNonOpaquePointerElementType(), ctx.resource.input.ptr_float4,
+-          {ir.getInt32(0), ir.getInt32(Reg), ir.getInt32(Lane)}
++          {ir.getInt32(0), RegIndex, ir.getInt32(Lane)}
+       );
+       return air.CreateConvertToHalf(ir.CreateLoad(ir.getFloatTy(), Ptr));
+     }
+     auto *Ptr = ir.CreateGEP(
+         ctx.resource.input.ptr_int4->getType()->getNonOpaquePointerElementType(), ctx.resource.input.ptr_int4,
+-        {ir.getInt32(0), ir.getInt32(Reg), ir.getInt32(Lane)}
++        {ir.getInt32(0), RegIndex, ir.getInt32(Lane)}
+     );
+     auto *Value = ir.CreateLoad(ir.getInt32Ty(), Ptr);
+     return ir.CreateBitCast(ir.CreateTrunc(Value, ir.getInt16Ty()), ir.getHalfTy());
+diff --git a/src/airconv/nt/dxil_converter_base.hpp b/src/airconv/nt/dxil_converter_base.hpp
+index ca13f52..3a704ea 100644
+--- a/src/airconv/nt/dxil_converter_base.hpp
++++ b/src/airconv/nt/dxil_converter_base.hpp
+@@ -94,7 +94,7 @@ private:
+   llvm::Expected<llvm::Value *> EmitLegacyF32ToF16(llvm::CallInst &Call);
+   llvm::Expected<llvm::Value *> EmitUnaryBits(llvm::CallInst &Call);
+   llvm::Expected<llvm::Value *> EmitBarrier(llvm::CallInst &Call);
+-  llvm::Expected<llvm::Value *> EmitLoadInput(const llvm::CallInst &Call);
++  llvm::Expected<llvm::Value *> EmitLoadInput(const llvm::CallInst &Call, bool AtVertex = false);
+   llvm::Expected<llvm::Value *> EmitStoreOutput(const llvm::CallInst &Call);
+   llvm::Expected<llvm::Value *> EmitSample(const llvm::CallInst &Call, llvm::StringRef Op);
+   llvm::Expected<llvm::Value *> EmitGather(const llvm::CallInst &Call, llvm::StringRef Op);
+-- 
+2.50.1 (Apple Git-155)
+
