@@ -25,7 +25,7 @@ fi
 CXX=(x86_64-w64-mingw32-g++ -O1 -static -I"$SRC/dxmt/src/nvngx" -I"$SRC/dxmt/external/nvapi")
 x86_64-w64-mingw32-gcc -O1 -static -I"$SRC/dxmt/external/nvapi" "$TESTS/smoke.c" -o "$BIN/smoke.exe" \
     -ld3d11 -ld3d12 -ldxgi -luuid || exit 1
-for t in tiled12 dlss12 heap12 bary12 atomic12 mesh12 gs12 sm6pso; do
+for t in tiled12 dlss12 heap12 bary12 atomic12 mesh12 gs12 query12 sm6pso; do
     "${CXX[@]}" "$TESTS/$t.cpp" -o "$BIN/$t.exe" -ld3d12 -ldxgi -luuid || exit 1
 done
 
@@ -56,9 +56,11 @@ compile mesh12.hlsl ps_6_5 ps_main ps_main.cso
 compile gs12.hlsl vs_6_0 vs_main gs12_vs.cso
 compile gs12.hlsl gs_6_0 gs_main gs12_gs.cso
 compile gs12.hlsl ps_6_0 ps_main gs12_ps.cso
+compile query12.hlsl vs_6_0 vs_main query12_vs.cso
+compile query12.hlsl ps_6_0 ps_main query12_ps.cso
 
 FAILED=()
-for run in smoke tiled12 dlss12 "dlss12 hires-mv" heap12 bary12 atomic12 mesh12 gs12; do
+for run in smoke tiled12 dlss12 "dlss12 hires-mv" heap12 bary12 atomic12 mesh12 gs12 query12; do
     echo "=== $run"
     set -- $run
     "$WINE" "$1.exe" "${@:2}" 2>&1 | tr -d '\r' | grep -v "^ok  " ; status=${PIPESTATUS[0]}

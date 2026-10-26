@@ -1,0 +1,591 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 20:01:40 +0100
+Subject: [PATCH] d3d12: occlusion and timestamp queries
+
+Occlusion queries count samples through Metal visibility results: draws go into a new 64-bit slot whenever the set of running queries changes or a render pass starts, and a compute pass sums each ended query's slots into its heap. Binary results are made 0/1 when resolved. Timestamp queries sample Metal's GPU timestamp counters at the end of an empty blit pass.
+---
+ src/d3d12/d3d12_command_allocator.cpp |   7 +
+ src/d3d12/d3d12_command_allocator.hpp |  29 ++++
+ src/d3d12/d3d12_command_encoder.hpp   |  11 ++
+ src/d3d12/d3d12_command_list.cpp      | 219 +++++++++++++++++++++++++-
+ src/d3d12/d3d12_command_queue.cpp     |  26 ++-
+ src/d3d12/d3d12_device.cpp            |  14 ++
+ src/d3d12/d3d12_device.hpp            |   9 ++
+ src/d3d12/d3d12_query_heap.cpp        |  24 +++
+ src/dxmt/dxmt_command.metal           |  25 +++
+ 9 files changed, 357 insertions(+), 7 deletions(-)
+
+diff --git a/src/d3d12/d3d12_command_allocator.cpp b/src/d3d12/d3d12_command_allocator.cpp
+index 48df749..40f00b9 100644
+--- a/src/d3d12/d3d12_command_allocator.cpp
++++ b/src/d3d12/d3d12_command_allocator.cpp
+@@ -82,6 +82,10 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
+ 
+   icb_.clear();
+ 
++  if (visibility_data_)
++    memset(visibility_data_, 0, sizeof(uint64_t) * visibility_slot_count_);
++  visibility_slot_count_ = 0;
++
+   copy_temp_allocator_.free_blocks(copy_temp_version_++);
+ 
+   return S_OK;
+@@ -137,6 +141,9 @@ MTLD3D12CommandAllocatorImpl::Reset() {
+       case EncoderType::TemporalUpscale:
+         reinterpret_cast<TemporalUpscaleEncoderData *>(next)->~TemporalUpscaleEncoderData();
+         break;
++      case EncoderType::SampleTimestamp:
++        reinterpret_cast<SampleTimestampEncoderData *>(next)->~SampleTimestampEncoderData();
++        break;
+       }
+       next = next->next;
+     }
+diff --git a/src/d3d12/d3d12_command_allocator.hpp b/src/d3d12/d3d12_command_allocator.hpp
+index 482792a..6ffffa7 100644
+--- a/src/d3d12/d3d12_command_allocator.hpp
++++ b/src/d3d12/d3d12_command_allocator.hpp
+@@ -26,6 +26,8 @@ namespace dxmt {
+ 
+ constexpr auto kCPUHeapSize = 0x400000u;
+ constexpr auto kGPUHeapSize = 0x400000u;
++// 64-bit visibility result slots per allocator for occlusion queries (one per run of draws that the same queries count).
++constexpr auto kVisibilitySlots = 0x10000u;
+ 
+ inline std::size_t
+ align_forward_adjustment(const void *const ptr, const std::size_t &alignment) noexcept {
+@@ -96,6 +98,10 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
+   RingBumpState<GpuPrivateBufferBlockAllocator> copy_temp_allocator_;
+   uint64_t copy_temp_version_;
+ 
++  WMT::Reference<WMT::Buffer> visibility_buffer_;
++  uint64_t *visibility_data_ = nullptr;
++  uint32_t visibility_slot_count_ = 0;
++
+ public:
+   MTLD3D12CommandAllocatorImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type);
+ 
+@@ -230,6 +236,29 @@ public:
+     return {ptr_add(gpu_heap_, aligned), aligned};
+   }
+ 
++  // A new visibility result slot, or the last one again once all are taken (results then overlap, but nothing
++  // that drew reads as hidden).
++  bool
++  AllocateVisibilitySlot(uint32_t &Slot) {
++    if (!visibility_buffer_) {
++      WMTBufferInfo info{};
++      info.length = sizeof(uint64_t) * kVisibilitySlots;
++      info.options = WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked;
++      visibility_buffer_ = device_->GetMTLDevice().newBuffer(info);
++      if (!visibility_buffer_ || !info.memory.ptr) {
++        visibility_buffer_ = {};
++        return false;
++      }
++      visibility_data_ = (uint64_t *)info.memory.ptr;
++      memset(visibility_data_, 0, info.length);
++    }
++    if (visibility_slot_count_ < kVisibilitySlots)
++      Slot = visibility_slot_count_++;
++    else
++      Slot = kVisibilitySlots - 1;
++    return true;
++  }
++
+   std::tuple<WMT::Buffer, uint64_t>
+   AllocateTempBuffer(size_t Size, size_t Alignment) {
+     assert(copy_temp_version_);
+diff --git a/src/d3d12/d3d12_command_encoder.hpp b/src/d3d12/d3d12_command_encoder.hpp
+index 9fef439..9435e51 100644
+--- a/src/d3d12/d3d12_command_encoder.hpp
++++ b/src/d3d12/d3d12_command_encoder.hpp
+@@ -32,6 +32,7 @@ enum class EncoderType {
+   Compute,
+   Resolve,
+   TemporalUpscale,
++  SampleTimestamp,
+ };
+ 
+ struct EncoderData {
+@@ -103,10 +104,20 @@ struct RenderEncoderData : EncoderData {
+   uint8_t dsv_readonly_flags;
+   uint8_t render_target_count;
+   bool use_visibility_result = 0;
++  obj_handle_t visibility_buffer = 0;
+   bool use_tessellation = 0;
+   bool use_geometry = 0;
+ };
+ 
++// A D3D12 timestamp query: an otherwise empty blit pass whose end is sampled into the query heap's counter buffer
++// (Metal samples only at pass boundaries; the pass needs one command, a fill of `dummy_buffer`).
++struct SampleTimestampEncoderData : EncoderData {
++  obj_handle_t sample_buffer;
++  uint32_t sample_index;
++  obj_handle_t dummy_buffer;
++  uint64_t dummy_offset;
++};
++
+ struct BlitEncoderData : EncoderData {
+   wmtcmd_blit_nop cmd_head;
+   wmtcmd_base *cmd_tail;
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index 317362f..37aff79 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -209,6 +209,31 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
+   WMTIndexType index_type;
+   uint64_t index_offset;
+ 
++  /* occlusion queries */
++
++  // Draws are counted into visibility result slots; a new slot starts whenever the set of running queries changes
++  // or a new render pass starts, so a query's count is the sum of the slots allocated between its begin and end.
++  struct RunningOcclusionQuery {
++    MTLD3D12QueryHeap *heap;
++    UINT index;
++    uint32_t first_slot;
++  };
++  std::vector<RunningOcclusionQuery> running_occlusion_queries_;
++  struct QuerySum {
++    uint32_t dst_index;
++    uint32_t begin;
++    uint32_t end;
++    uint32_t binary;
++  };
++  struct EndedOcclusionQuery {
++    obj_handle_t results;
++    QuerySum sum;
++  };
++  // Ended queries whose sums are written to their heaps in one compute pass (before a resolve, or at Close).
++  std::vector<EndedOcclusionQuery> ended_occlusion_queries_;
++  bool visibility_dirty_ = false;
++  bool visibility_counting_ = false;
++
+   UINT num_rtvs;
+   D3D12_CPU_DESCRIPTOR_HANDLE rtvs[8];
+   D3D12_CPU_DESCRIPTOR_HANDLE dsv;
+@@ -507,6 +532,11 @@ public:
+ 
+     ResetState(pInitialPipelineState);
+ 
++    running_occlusion_queries_.clear();
++    ended_occlusion_queries_.clear();
++    visibility_dirty_ = false;
++    visibility_counting_ = false;
++
+     encoder_count = std::numeric_limits<size_t>::max();
+     return allocator_->StartRecord(&entry);
+   }
+@@ -549,6 +579,7 @@ public:
+   Close() {
+     if (encoder_count < std::numeric_limits<size_t>::max())
+       return E_FAIL;
++    WriteOcclusionQueryResults();
+     return allocator_->EndRecord(&encoder_count);
+   };
+ 
+@@ -668,11 +699,17 @@ public:
+       dirty_state_.set(DirtyState::BlendFactor, DirtyState::StencilRef);
+       dirty_state_.set(DirtyState::Topology);
+       dirty_state_.set(DirtyState::GraphicsPipelineState);
++
++      visibility_counting_ = false;
++      visibility_dirty_ = !running_occlusion_queries_.empty();
+     }
+ 
+     if (!pso_graphics_)
+       return DrawCallStatus::Invalid;
+ 
++    if (visibility_dirty_)
++      EncodeVisibilityResultMode();
++
+     if (pso_graphics_->is_geometry && dirty_state_.test(DirtyState::Topology)) {
+       dirty_state_.set(DirtyState::GraphicsPipelineState);
+       dirty_state_.clr(DirtyState::Topology);
+@@ -1946,14 +1983,148 @@ public:
+     // do nothing for now
+   };
+ 
++  void
++  EncodeVisibilityResultMode() {
++    visibility_dirty_ = false;
++    auto render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
++    uint32_t slot = 0;
++    if (running_occlusion_queries_.empty() || !allocator_->AllocateVisibilitySlot(slot)) {
++      if (!visibility_counting_)
++        return;
++      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setvisibilitymode>();
++      cmd.type = WMTRenderCommandSetVisibilityMode;
++      cmd.mode = WMTVisibilityResultModeDisabled;
++      cmd.offset = 0;
++      visibility_counting_ = false;
++      return;
++    }
++    render->use_visibility_result = true;
++    render->visibility_buffer = allocator_->visibility_buffer_;
++    auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setvisibilitymode>();
++    cmd.type = WMTRenderCommandSetVisibilityMode;
++    cmd.mode = WMTVisibilityResultModeCounting;
++    cmd.offset = slot * sizeof(uint64_t);
++    visibility_counting_ = true;
++  }
++
++  // One compute pass that writes sums of 64-bit values from `Src` into `Dst` (see cs_sum_query_results).
++  void
++  EncodeQuerySums(const QuerySum *Sums, uint32_t Count, obj_handle_t Src, obj_handle_t Dst, uint64_t DstOffset) {
++    auto pso = device_->GetQueryResultPipeline();
++    if (!pso || !Count)
++      return;
++    allocator_->InvalidateCurrentPass();
++    auto compute = allocator_->AllocatePass<ComputeEncoderData>();
++    compute->type = EncoderType::Compute;
++    compute->cmd_head.type = WMTComputeCommandNop;
++    compute->cmd_head.next.set(0);
++    compute->cmd_tail = (wmtcmd_base *)&compute->cmd_head;
++
++    auto &setpso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
++    setpso.type = WMTComputeCommandSetPSO;
++    setpso.pso = pso;
++    setpso.threadgroup_size = {64, 1, 1};
++
++    auto count = allocator_->AllocateCommandData<uint32_t>(1);
++    *count = Count;
++    auto &set_count = allocator_->EncodeComputeCommand<wmtcmd_compute_setbytes>();
++    set_count.type = WMTComputeCommandSetBytes;
++    set_count.bytes.set(count);
++    set_count.length = sizeof(uint32_t);
++    set_count.index = 0;
++
++    auto [sums, sums_offset] = allocator_->AllocateGPUHeap(sizeof(QuerySum) * Count, 16);
++    memcpy(sums, Sums, sizeof(QuerySum) * Count);
++    auto &set_sums = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
++    set_sums.type = WMTComputeCommandSetBuffer;
++    set_sums.buffer = allocator_->gpu_heap_buffer_;
++    set_sums.offset = sums_offset;
++    set_sums.index = 1;
++
++    auto &set_src = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
++    set_src.type = WMTComputeCommandSetBuffer;
++    set_src.buffer = Src;
++    set_src.offset = 0;
++    set_src.index = 2;
++
++    auto &set_dst = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
++    set_dst.type = WMTComputeCommandSetBuffer;
++    set_dst.buffer = Dst;
++    set_dst.offset = DstOffset;
++    set_dst.index = 3;
++
++    auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
++    dispatch.type = WMTComputeCommandDispatchThreads;
++    dispatch.size = {Count, 1, 1};
++
++    allocator_->InvalidateCurrentPass();
++  }
++
++  // Writes the sums of ended occlusion queries to their heaps, one compute pass per run of queries on the same heap.
++  void
++  WriteOcclusionQueryResults() {
++    if (ended_occlusion_queries_.empty())
++      return;
++    std::vector<QuerySum> sums;
++    for (size_t i = 0; i < ended_occlusion_queries_.size();) {
++      auto results = ended_occlusion_queries_[i].results;
++      sums.clear();
++      for (; i < ended_occlusion_queries_.size() && ended_occlusion_queries_[i].results == results; i++)
++        sums.push_back(ended_occlusion_queries_[i].sum);
++      EncodeQuerySums(sums.data(), sums.size(), allocator_->visibility_buffer_, results, 0);
++    }
++    ended_occlusion_queries_.clear();
++  }
++
+   void STDMETHODCALLTYPE
+   BeginQuery(ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT Index) {
+-    DEBUG("BeginQuery");
++    auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
++    if (!heap || Index >= heap->Count)
++      return;
++    if ((Type == D3D12_QUERY_TYPE_OCCLUSION || Type == D3D12_QUERY_TYPE_BINARY_OCCLUSION) && heap->Results) {
++      running_occlusion_queries_.push_back({heap, Index, allocator_->visibility_slot_count_});
++      visibility_dirty_ = true;
++    }
+   };
+ 
+   void STDMETHODCALLTYPE
+   EndQuery(ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT Index) {
+-    DEBUG("EndQuery");
++    auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
++    if (!heap || Index >= heap->Count)
++      return;
++    switch (Type) {
++    case D3D12_QUERY_TYPE_OCCLUSION:
++    case D3D12_QUERY_TYPE_BINARY_OCCLUSION: {
++      for (auto it = running_occlusion_queries_.begin(); it != running_occlusion_queries_.end(); ++it) {
++        if (it->heap != heap || it->index != Index)
++          continue;
++        // Binary results are made 0/1 when resolved, so both types store the count.
++        ended_occlusion_queries_.push_back(
++            {heap->Results, {Index, it->first_slot, allocator_->visibility_slot_count_, 0}}
++        );
++        running_occlusion_queries_.erase(it);
++        visibility_dirty_ = true;
++        break;
++      }
++      break;
++    }
++    case D3D12_QUERY_TYPE_TIMESTAMP: {
++      if (!heap->Timestamps)
++        break;
++      allocator_->InvalidateCurrentPass();
++      auto pass = allocator_->AllocatePass<SampleTimestampEncoderData>();
++      pass->type = EncoderType::SampleTimestamp;
++      pass->sample_buffer = heap->Timestamps;
++      pass->sample_index = Index;
++      auto [dummy, dummy_offset] = allocator_->AllocateGPUHeap(4, 4);
++      pass->dummy_buffer = allocator_->gpu_heap_buffer_;
++      pass->dummy_offset = dummy_offset;
++      allocator_->InvalidateCurrentPass();
++      break;
++    }
++    default:
++      break;
++    }
+   };
+ 
+   void STDMETHODCALLTYPE
+@@ -1961,10 +2132,48 @@ public:
+       ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT StartIndex, UINT QueryCount, ID3D12Resource *pDstBuffer,
+       UINT64 AlignedDstBufferOffset
+   ) {
+-    // Queries don't record anything yet. Until they do, results say "visible" and "no time passed" rather than
+-    // leaving the buffer as it was: Unreal Engine culls everything its occlusion queries report as 0 samples.
+-    if (!pDstBuffer || !QueryCount || !PreBlit())
++    auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
++    if (!heap || !pDstBuffer || !QueryCount || StartIndex + QueryCount > heap->Count)
++      return;
++    obj_handle_t dst = static_cast<MTLD3D12Resource *>(pDstBuffer)->buffer->current()->buffer();
++
++    if ((Type == D3D12_QUERY_TYPE_OCCLUSION || Type == D3D12_QUERY_TYPE_BINARY_OCCLUSION) && heap->Results) {
++      WriteOcclusionQueryResults();
++      if (Type == D3D12_QUERY_TYPE_BINARY_OCCLUSION) {
++        std::vector<QuerySum> sums(QueryCount);
++        for (UINT i = 0; i < QueryCount; i++)
++          sums[i] = {i, StartIndex + i, StartIndex + i + 1, 1};
++        EncodeQuerySums(sums.data(), QueryCount, heap->Results, dst, AlignedDstBufferOffset);
++        return;
++      }
++      if (!PreBlit())
++        return;
++      auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
++      cmd_cp.type = WMTBlitCommandCopyFromBufferToBuffer;
++      cmd_cp.src = heap->Results;
++      cmd_cp.dst = dst;
++      cmd_cp.src_offset = sizeof(uint64_t) * StartIndex;
++      cmd_cp.dst_offset = AlignedDstBufferOffset;
++      cmd_cp.copy_length = sizeof(uint64_t) * QueryCount;
+       return;
++    }
++
++    if (!PreBlit())
++      return;
++
++    if (Type == D3D12_QUERY_TYPE_TIMESTAMP && heap->Timestamps) {
++      auto &cmd = allocator_->EncodeBlitCommand<wmtcmd_blit_resolvecounters>();
++      cmd.type = WMTBlitCommandResolveCounters;
++      cmd.sample_buffer = heap->Timestamps;
++      cmd.start = StartIndex;
++      cmd.len = QueryCount;
++      cmd.dst_buffer = dst;
++      cmd.dst_offset = AlignedDstBufferOffset;
++      return;
++    }
++
++    // Placeholder results for queries without storage: "visible" and "now" rather than leaving the buffer as it
++    // was (Unreal Engine culls everything its occlusion queries report as 0 samples), zeros for statistics.
+     uint64_t stride = Type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS ? sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS)
+                       : Type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 || Type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1 ||
+                               Type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2 || Type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3
+diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
+index 6297604..921e3ba 100644
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -457,6 +457,7 @@ public:
+             render_pass_info.render_target_array_length = data->render_target_array_length;
+             render_pass_info.render_target_width = data->render_target_width;
+             render_pass_info.render_target_height = data->render_target_height;
++            render_pass_info.visibility_buffer = data->visibility_buffer;
+           }
+           auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
+           encoder.waitForFence(fence_, WMTRenderStageVertex);
+@@ -501,6 +502,27 @@ public:
+ 
+           break;
+         }
++        case EncoderType::SampleTimestamp: {
++          auto data = static_cast<SampleTimestampEncoderData *>(current);
++          WMTSampleBufferAttachmentInfo sample_info{};
++          sample_info.sample_buffer = data->sample_buffer;
++          sample_info.start_of_encoder_sample_index = ~0ull; // MTLCounterDontSample
++          sample_info.end_of_encoder_sample_index = data->sample_index;
++          auto encoder = cmdbuf.blitCommandEncoderWithSampleBuffers(&sample_info, 1);
++          encoder.setLabel(WMT::String::string("SampleTimestamp", WMTUTF8StringEncoding));
++          encoder.waitForFence(fence_);
++          struct wmtcmd_blit_fillbuffer fill;
++          fill.next.set(nullptr);
++          fill.type = WMTBlitCommandFillBuffer;
++          fill.buffer = data->dummy_buffer;
++          fill.offset = data->dummy_offset;
++          fill.length = 4;
++          fill.value = 0;
++          encoder.encodeCommands((const wmtcmd_blit_nop *)&fill);
++          encoder.updateFence(fence_);
++          encoder.endEncoding();
++          break;
++        }
+         case EncoderType::TemporalUpscale: {
+           // MetalFX encodes its own passes; hand the queue's ordering to the scaler's fence and back.
+           auto data = static_cast<TemporalUpscaleEncoderData *>(current);
+@@ -564,8 +586,8 @@ public:
+   HRESULT STDMETHODCALLTYPE
+   GetClockCalibration(UINT64 *gpu_timestamp, UINT64 *cpu_timestamp) {
+     // Unreal Engine's D3D12 renderer stops with a fatal error when this fails. Both clocks are taken from the
+-    // performance counter, the GPU one converted to nanoseconds (GetTimestampFrequency), so the pair is
+-    // consistent; D3D12 timestamp queries don't record GPU times yet.
++    // performance counter, the GPU one converted to nanoseconds (GetTimestampFrequency). Metal's GPU timestamps,
++    // which timestamp queries record, are nanoseconds on the same clock (tests/query12 checks this).
+     if (!gpu_timestamp || !cpu_timestamp)
+       return E_INVALIDARG;
+     LARGE_INTEGER counter, frequency;
+diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
+index 97e9e35..d4ba8e2 100644
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -60,6 +60,7 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device>> {
+   dxmt::mutex scaler_lock_;
+   std::vector<CachedTemporalScaler> scaler_cache_;
+   WMT::Reference<WMT::ComputePipelineState> mv_downscale_pso_;
++  WMT::Reference<WMT::ComputePipelineState> query_result_pso_;
+ 
+ public:
+   MTLD3D12DeviceImpl(IMTLDXGIAdapter *adapter, D3D_FEATURE_LEVEL min_feature_level) :
+@@ -1412,6 +1413,19 @@ public:
+     return mv_downscale_pso_;
+   }
+ 
++  WMT::ComputePipelineState
++  GetQueryResultPipeline() {
++    std::lock_guard<dxmt::mutex> lock(scaler_lock_);
++    if (!query_result_pso_) {
++      WMT::Reference<WMT::Error> err;
++      auto function = command_library.getLibrary().newFunction("cs_sum_query_results");
++      query_result_pso_ = GetMTLDevice().newComputePipelineState(function, err);
++      if (!query_result_pso_)
++        ERR("Failed to create the query result pipeline: ", err.description().getUTF8String());
++    }
++    return query_result_pso_;
++  }
++
+   virtual FormatCapability
+   GetMTLPixelFormatCapability(WMTPixelFormat Format) final {
+     Format = ORIGINAL_FORMAT(Format);
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index 67988fe..fded268 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -132,6 +132,12 @@ public:
+ 
+ class MTLD3D12QueryHeap : public ID3D12QueryHeap {
+ public:
++  D3D12_QUERY_HEAP_TYPE Type;
++  UINT Count;
++  // Occlusion heaps: one 64-bit sample count per query, written on the GPU when the command list's query ends.
++  WMT::Reference<WMT::Buffer> Results;
++  // Timestamp heaps: one Metal timestamp counter sample per query.
++  WMT::Reference<WMT::CounterSampleBuffer> Timestamps;
+ };
+ 
+ class MTLD3D12PipelineState : public ID3D12PipelineState {
+@@ -224,6 +230,9 @@ public:
+   // Compute pipeline that turns display-size motion vectors into render-size ones (cs_downscale_dilated_mv).
+   virtual WMT::ComputePipelineState GetMotionVectorDownscalePipeline() = 0;
+ 
++  // Compute pipeline that turns visibility results into D3D12 occlusion query results (cs_sum_query_results).
++  virtual WMT::ComputePipelineState GetQueryResultPipeline() = 0;
++
+   EventListener event_listener;
+ 
+   WMT::Reference<WMT::DepthStencilState> default_depth_stencil_state;
+diff --git a/src/d3d12/d3d12_query_heap.cpp b/src/d3d12/d3d12_query_heap.cpp
+index 904c58f..0f987a8 100644
+--- a/src/d3d12/d3d12_query_heap.cpp
++++ b/src/d3d12/d3d12_query_heap.cpp
+@@ -27,6 +27,30 @@ public:
+ 
+   HRESULT
+   Initialize(const D3D12_QUERY_HEAP_DESC *pDesc) {
++    if (!pDesc || !pDesc->Count)
++      return E_INVALIDARG;
++    Type = pDesc->Type;
++    Count = pDesc->Count;
++    // Heaps without storage here (pipeline and stream-output statistics, or a failed allocation) resolve to
++    // placeholder results, see ResolveQueryData.
++    switch (Type) {
++    case D3D12_QUERY_HEAP_TYPE_OCCLUSION: {
++      WMTBufferInfo info{};
++      info.length = sizeof(uint64_t) * Count;
++      info.options = WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked;
++      Results = device_->GetMTLDevice().newBuffer(info);
++      if (Results && info.memory.ptr)
++        memset(info.memory.ptr, 0, info.length);
++      break;
++    }
++    case D3D12_QUERY_HEAP_TYPE_TIMESTAMP:
++      Timestamps = device_->GetMTLDevice().newCounterSampleBuffer(Count, false);
++      if (!Timestamps)
++        WARN("D3D12QueryHeap: no GPU timestamp counters; timestamps come from the CPU clock");
++      break;
++    default:
++      break;
++    }
+     return S_OK;
+   }
+ 
+diff --git a/src/dxmt/dxmt_command.metal b/src/dxmt/dxmt_command.metal
+index 508b5d6..3eecfa5 100644
+--- a/src/dxmt/dxmt_command.metal
++++ b/src/dxmt/dxmt_command.metal
+@@ -653,6 +653,31 @@ struct DXMTClearUintMetadata {
+   downscaled.write(lo_mv_pixel.xyxy, pos); 
+ }
+ 
++// D3D12 query results: each entry sums a range of 64-bit values (visibility results, or one stored count) into
++// dst[dst_index], as a 0/1 flag for binary occlusion queries.
++struct DXMTQuerySum {
++  uint dst_index;
++  uint begin;
++  uint end;
++  uint binary;
++};
++
++[[kernel]] void cs_sum_query_results(
++  uint id [[thread_position_in_grid]],
++  constant uint &count [[buffer(0)]],
++  device const DXMTQuerySum *sums [[buffer(1)]],
++  device const ulong *src [[buffer(2)]],
++  device ulong *dst [[buffer(3)]]
++) {
++  if (id >= count)
++    return;
++  DXMTQuerySum sum = sums[id];
++  ulong total = 0;
++  for (uint i = sum.begin; i < sum.end; i++)
++    total += src[i];
++  dst[sum.dst_index] = sum.binary ? ulong(total != 0) : total;
++}
++
+ [[kernel]] void tile_barrier(ushort2 pos [[thread_position_in_threadgroup]]) {
+   // empty
+ }
+-- 
+2.50.1 (Apple Git-155)
+
