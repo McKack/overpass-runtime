@@ -1,0 +1,451 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 19:46:25 +0100
+Subject: [PATCH] d3d12: tessellation, and query results that don't cull
+ everything
+
+Pipelines with hull and domain shaders run as Metal mesh pipelines, as DXMT emulates tessellation for D3D11: airconv's vertex-hull function (with the root signatures of both stages) as the object function, the domain shader as the mesh function; one variant per index buffer format, chosen per draw. A pass-through geometry shader after the domain shader is folded into the domain stage; any other one is ignored with a warning, as in D3D11. DrawInstanced and DrawIndexedInstanced with patch-list topologies dispatch one object threadgroup per group of patches and instance. Not yet: tessellated draws through ExecuteIndirect. D3D12 queries still record nothing; ResolveQueryData now writes 'visible' for occlusion queries, the performance counter for timestamps and zeros otherwise, instead of leaving the destination untouched (Unreal Engine culled whatever its queries reported as 0 samples). Verified: Ghostrunner (UE4, D3D12) plays its first level.
+---
+ src/d3d12/d3d12_command_list.cpp      | 129 ++++++++++++++-
+ src/d3d12/d3d12_device.hpp            |   9 ++
+ src/d3d12/d3d12_pipeline_graphics.cpp | 216 +++++++++++++++++++++++++-
+ 3 files changed, 351 insertions(+), 3 deletions(-)
+
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index 874e26d..317362f 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -44,6 +44,7 @@ enum class DrawCallStatus {
+   Invalid,
+   Ordinary,
+   Geometry,
++  Tessellation,
+ };
+ 
+ inline bool
+@@ -702,7 +703,9 @@ public:
+       dirty_state_.clr(DirtyState::GraphicsPipelineState);
+     }
+ 
+-    auto status = pso_graphics_->is_geometry ? DrawCallStatus::Geometry : DrawCallStatus::Ordinary;
++    auto status = pso_graphics_->is_tessellation ? DrawCallStatus::Tessellation
++                  : pso_graphics_->is_geometry   ? DrawCallStatus::Geometry
++                                                 : DrawCallStatus::Ordinary;
+ 
+     if (dirty_state_.test(DirtyState::VertexBuffer)) {
+       auto [Offset, Stride] = PopulateVertexBufferTable(1);
+@@ -840,6 +843,62 @@ public:
+     D3D12_GPU_VIRTUAL_ADDRESS IndexBuffer;
+   };
+ 
++  struct DXMT_DRAW_ARGUMENTS {
++    UINT VertexCount;
++    UINT InstanceCount;
++    UINT StartVertex;
++    UINT StartInstance;
++  };
++
++  struct DXMT_DRAW_INDEXED_ARGUMENTS {
++    UINT IndexCount;
++    UINT InstanceCount;
++    UINT StartIndex;
++    INT BaseVertex;
++    UINT StartInstance;
++  };
++
++  // A tessellated draw: one object threadgroup per group of patches (32 threads, threads-per-patch of them for
++  // each patch) and instance; the draw arguments and index buffer go to the object (vertex-hull) stage.
++  void
++  TessellationDraw(
++      bool Indexed, uint32_t ControlPointCount, UINT VertexOrIndexCountPerInstance, UINT InstanceCount,
++      uint64_t DrawArgumentsOffset
++  ) {
++    if (!ControlPointCount || !pso_graphics_->tess_threads_per_patch)
++      return;
++    auto patch_count = VertexOrIndexCountPerInstance / ControlPointCount;
++    if (!patch_count || !InstanceCount)
++      return;
++    auto threads_per_patch = pso_graphics_->tess_threads_per_patch;
++    auto patch_per_group = 32 / threads_per_patch;
++    auto group_count = (patch_count - 1) / patch_per_group + 1;
++
++    auto &cmd_setpso = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
++    cmd_setpso.type = WMTRenderCommandSetPSO;
++    cmd_setpso.pso = pso_graphics_->GetTessellationVariant(Indexed, index_type);
++
++    auto &cmd_draw_args = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
++    cmd_draw_args.type = WMTRenderCommandSetObjectBuffer;
++    cmd_draw_args.buffer = allocator_->gpu_heap_buffer_;
++    cmd_draw_args.offset = DrawArgumentsOffset;
++    cmd_draw_args.index = SM50_BINDING_INDEX_DRAW_ARGUMENTS;
++
++    if (Indexed) {
++      auto &cmd_index_buffer = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
++      cmd_index_buffer.type = WMTRenderCommandSetObjectBuffer;
++      cmd_index_buffer.buffer = index_buffer;
++      cmd_index_buffer.offset = index_offset;
++      cmd_index_buffer.index = SM50_BINDING_INDEX_INDEX_BUFFER;
++    }
++
++    auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups>();
++    cmd.type = WMTRenderCommandDrawMeshThreadgroups;
++    cmd.threadgroup_per_grid = {group_count, InstanceCount, 1};
++    cmd.object_threadgroup_size = {threads_per_patch, patch_per_group, 1};
++    cmd.mesh_threadgroup_size = {32, 1, 1};
++  }
++
+   void STDMETHODCALLTYPE
+   DrawInstanced(UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, UINT StartInstanceLocation) {
+     WMTPrimitiveType primitive_type;
+@@ -850,6 +909,17 @@ public:
+     if (status == DrawCallStatus::Invalid)
+       return;
+ 
++    if (status == DrawCallStatus::Tessellation) {
++      auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(DXMT_DRAW_ARGUMENTS), 32);
++      auto draw_argument = reinterpret_cast<DXMT_DRAW_ARGUMENTS *>(Ptr);
++      draw_argument->VertexCount = VertexCountPerInstance;
++      draw_argument->InstanceCount = InstanceCount;
++      draw_argument->StartVertex = StartVertexLocation;
++      draw_argument->StartInstance = StartInstanceLocation;
++      TessellationDraw(false, cp_count, VertexCountPerInstance, InstanceCount, Offset);
++      return;
++    }
++
+     if (status == DrawCallStatus::Geometry) {
+       auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(DXMT_DRAW_DYNAMIC_IB_ARGUMENTS), 32);
+       DXMT_DRAW_DYNAMIC_IB_ARGUMENTS *draw_argument = reinterpret_cast<DXMT_DRAW_DYNAMIC_IB_ARGUMENTS *>(Ptr);
+@@ -918,6 +988,18 @@ public:
+     if (status == DrawCallStatus::Invalid)
+       return;
+ 
++    if (status == DrawCallStatus::Tessellation) {
++      auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), 32);
++      auto draw_argument = reinterpret_cast<DXMT_DRAW_INDEXED_ARGUMENTS *>(Ptr);
++      draw_argument->IndexCount = IndexCountPerInstance;
++      draw_argument->InstanceCount = InstanceCount;
++      draw_argument->StartIndex = StartVertexLocation;
++      draw_argument->BaseVertex = BaseVertexLocation;
++      draw_argument->StartInstance = StartInstanceLocation;
++      TessellationDraw(true, cp_count, IndexCountPerInstance, InstanceCount, Offset);
++      return;
++    }
++
+     if (status == DrawCallStatus::Geometry) {
+       auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(DXMT_DRAW_DYNAMIC_IB_ARGUMENTS), 32);
+       DXMT_DRAW_DYNAMIC_IB_ARGUMENTS *draw_argument = reinterpret_cast<DXMT_DRAW_DYNAMIC_IB_ARGUMENTS *>(Ptr);
+@@ -1879,7 +1961,50 @@ public:
+       ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT StartIndex, UINT QueryCount, ID3D12Resource *pDstBuffer,
+       UINT64 AlignedDstBufferOffset
+   ) {
+-    DEBUG("ResolveQueryData");
++    // Queries don't record anything yet. Until they do, results say "visible" and "no time passed" rather than
++    // leaving the buffer as it was: Unreal Engine culls everything its occlusion queries report as 0 samples.
++    if (!pDstBuffer || !QueryCount || !PreBlit())
++      return;
++    uint64_t stride = Type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS ? sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS)
++                      : Type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 || Type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1 ||
++                              Type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2 || Type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3
++                          ? sizeof(D3D12_QUERY_DATA_SO_STATISTICS)
++                          : sizeof(UINT64);
++    uint64_t value = 0;
++    switch (Type) {
++    case D3D12_QUERY_TYPE_OCCLUSION:
++      value = 0x10000;
++      break;
++    case D3D12_QUERY_TYPE_BINARY_OCCLUSION:
++      value = 1;
++      break;
++    case D3D12_QUERY_TYPE_TIMESTAMP: {
++      // Same clock as GetClockCalibration: the performance counter in nanoseconds.
++      LARGE_INTEGER counter, frequency;
++      QueryPerformanceCounter(&counter);
++      QueryPerformanceFrequency(&frequency);
++      value = (uint64_t)counter.QuadPart / frequency.QuadPart * 1000000000 +
++              (uint64_t)counter.QuadPart % frequency.QuadPart * 1000000000 / frequency.QuadPart;
++      break;
++    }
++    default:
++      break;
++    }
++    auto length = stride * QueryCount;
++    auto [Ptr, Offset] = allocator_->AllocateGPUHeap(length, 16);
++    memset(Ptr, 0, length);
++    if (stride == sizeof(UINT64)) {
++      for (UINT i = 0; i < QueryCount; i++)
++        reinterpret_cast<uint64_t *>(Ptr)[i] = value;
++    }
++
++    auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
++    cmd_cp.type = WMTBlitCommandCopyFromBufferToBuffer;
++    cmd_cp.src = allocator_->gpu_heap_buffer_;
++    cmd_cp.dst = static_cast<MTLD3D12Resource *>(pDstBuffer)->buffer->current()->buffer();
++    cmd_cp.src_offset = Offset;
++    cmd_cp.dst_offset = AlignedDstBufferOffset;
++    cmd_cp.copy_length = length;
+   };
+ 
+   void STDMETHODCALLTYPE SetPredication(ID3D12Resource *pBuffer, UINT64 AlignedBufferOffset, D3D12_PREDICATION_OP Op) {
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index a19d0b0..67988fe 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -158,12 +158,21 @@ public:
+   bool mesh_pipeline = false;
+   WMTSize object_threadgroup_size = {1, 1, 1};
+   WMTSize mesh_threadgroup_size = {1, 1, 1};
++  // Tessellation pipelines (hull and domain shaders) run as mesh pipelines; threads per patch in the hull stage.
++  bool is_tessellation = false;
++  uint32_t tess_threads_per_patch = 0;
+ 
+   virtual WMT::DepthStencilState GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) = 0;
+ 
+   virtual WMT::RenderPipelineState
+   GetRenderPipelineVariant(D3D12_PRIMITIVE_TOPOLOGY Topology) = 0;
+ 
++  // The tessellation pipeline for a draw: non-indexed, or with 16- or 32-bit indices.
++  virtual WMT::RenderPipelineState
++  GetTessellationVariant(bool Indexed, WMTIndexType IndexType) {
++    return {};
++  }
++
+   virtual void AddRefPrivate() = 0;
+   virtual void ReleasePrivate() = 0;
+ };
+diff --git a/src/d3d12/d3d12_pipeline_graphics.cpp b/src/d3d12/d3d12_pipeline_graphics.cpp
+index 069865f..47e5104 100644
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -1041,6 +1041,218 @@ public:
+   }
+ };
+ 
++// Hull and domain shaders as a Metal mesh pipeline, the way D3D11 emulates tessellation: the vertex and hull
++// shaders form the object function, the tessellator and the domain shader the mesh function. Each draw gets the
++// variant for its index buffer format.
++class MTLD3D12TessellationGraphicsPipelineStateImpl : public MTLD3D12GraphicsPipelineStateImpl {
++protected:
++  MTL_SHADER_REFLECTION ref_hs;
++  MTL_SHADER_REFLECTION ref_ds;
++
++  WMT::Reference<WMT::RenderPipelineState> pso_index16;
++  WMT::Reference<WMT::RenderPipelineState> pso_index32;
++
++public:
++  MTLD3D12TessellationGraphicsPipelineStateImpl(MTLD3D12Device *pDevice) :
++      MTLD3D12GraphicsPipelineStateImpl(pDevice) {}
++
++  virtual HRESULT
++  Initialize(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
++    if (pDesc->StreamOutput.NumEntries) {
++      ERR("CreatePipelineState: SO not supported");
++      return E_NOTIMPL;
++    }
++
++    if (!pDesc->VS.pShaderBytecode || !pDesc->HS.pShaderBytecode || !pDesc->DS.pShaderBytecode) {
++      return E_INVALIDARG;
++    }
++
++    HRESULT hr;
++    SM50Shader shader_vs, shader_hs, shader_ds;
++    SM50Error sm50_err;
++    auto metal = device_->GetMTLDevice();
++    WMT::Reference<WMT::Error> err;
++    WMT::Reference<WMT::Function> vshs_func_none, vshs_func_index16, vshs_func_index32, ds_func, ps_func;
++
++    SM50_SHADER_COMMON_DATA common;
++    common.flags = metal.supportsFamily(WMTGPUFamilyApple8) ? SM50_SHADER_FLAG{}
++                                                            : SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX;
++    common.type = SM50_SHADER_COMMON;
++    common.metal_version = SM50_SHADER_METAL_310;
++    common.next = nullptr;
++
++    if (FAILED(hr = InitializeShader(pDesc->VS, &shader_vs, &ref_vs)))
++      return hr;
++    if (FAILED(hr = InitializeShader(pDesc->HS, &shader_hs, &ref_hs)))
++      return hr;
++    if (FAILED(hr = InitializeShader(pDesc->DS, &shader_ds, &ref_ds)))
++      return hr;
++
++    // A geometry shader after the domain shader works when it only passes vertices through (e.g. to pick the
++    // render target slice): the domain stage does its job. Any other one is ignored, as D3D11 does.
++    uint32_t gs_passthrough_data = ~0u;
++    if (pDesc->GS.pShaderBytecode) {
++      SM50Shader shader_gs;
++      MTL_SHADER_REFLECTION ref_gs;
++      if (FAILED(hr = InitializeShader(pDesc->GS, &shader_gs, &ref_gs)))
++        return hr;
++      gs_passthrough_data = ref_gs.GeometryShader.GSPassThrough;
++      if (gs_passthrough_data == ~0u)
++        WARN("CreatePipelineState: geometry shader after tessellation isn't a pass-through one; ignored");
++    }
++
++    uint32_t max_potential_factor = ref_ds.PostTessellator.MaxPotentialTessFactor;
++    if (!metal.supportsFamily(WMTGPUFamilyApple9))
++      max_potential_factor = std::min(8u, max_potential_factor);
++    if ((float)max_potential_factor < ref_hs.Tessellator.MaxFactor) {
++      WARN("maxtessfactor(", ref_hs.Tessellator.MaxFactor, ") is too large for a mesh pipeline. Clamping to ",
++           max_potential_factor);
++    }
++
++    // Each stage binds its resources through the root signature, or through the one embedded in its shader.
++    auto root_signature = [&](const D3D12_SHADER_BYTECODE &Shader, SM50_SHADER_COMPILATION_ARGUMENT_TYPE Type,
++                              void *Next) {
++      SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
++      rootsig.type = Type;
++      if (pDesc->pRootSignature) {
++        rootsig.bytecode_length =
++            static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature)->GetBlob(&rootsig.bytecode);
++      } else {
++        rootsig.bytecode = Shader.pShaderBytecode;
++        rootsig.bytecode_length = Shader.BytecodeLength;
++      }
++      rootsig.next = Next;
++      return rootsig;
++    };
++
++    SM50_SHADER_PSO_TESSELLATOR_DATA tessellator;
++    tessellator.type = SM50_SHADER_PSO_TESSELLATOR;
++    tessellator.max_potential_tess_factor = max_potential_factor;
++
++    {
++      SM50_SHADER_IA_INPUT_LAYOUT_DATA data_ia_layout;
++      data_ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
++      std::vector<SM50_IA_INPUT_ELEMENT> elements(pDesc->InputLayout.NumElements);
++      if (FAILED(
++              hr = ExtractMTLInputLayoutElements(
++                  device_, pDesc->VS.pShaderBytecode, pDesc->InputLayout.pInputElementDescs,
++                  pDesc->InputLayout.NumElements, elements.data(), &data_ia_layout.num_elements
++              )
++          ))
++        return hr;
++      elements.resize(data_ia_layout.num_elements);
++      data_ia_layout.elements = elements.data();
++      slot_mask = 0;
++      for (auto &element : elements) {
++        slot_mask |= (1 << element.slot);
++      }
++      data_ia_layout.slot_mask = slot_mask;
++
++      auto rootsig_vs = root_signature(pDesc->VS, SM50_SHADER_ROOT_SIGNATURE2, &common);
++      auto rootsig_hs = root_signature(pDesc->HS, SM50_SHADER_ROOT_SIGNATURE, &rootsig_vs);
++      tessellator.next = &rootsig_hs;
++      data_ia_layout.next = &tessellator;
++
++      auto compile_vshs = [&](SM50_INDEX_BUFFER_FORMAT IndexFormat) -> WMT::Reference<WMT::Function> {
++        data_ia_layout.index_buffer_format = IndexFormat;
++        SM50ShaderBitcode vshs_bitcode;
++        if (SM50CompileTessellationPipelineHull(
++                shader_vs, shader_hs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data_ia_layout, "vshs_main",
++                &vshs_bitcode, &sm50_err
++            )) {
++          ERR("Failed to compile vertex-hull shader: ", SM50GetErrorMessageString(sm50_err));
++          SM50FreeError(sm50_err);
++          return {};
++        }
++        SM50_COMPILED_BITCODE vshs_bitcode_compiled;
++        SM50GetCompiledBitcode(vshs_bitcode, &vshs_bitcode_compiled);
++        auto vshs_data = WMT::MakeDispatchData(vshs_bitcode_compiled.Data, vshs_bitcode_compiled.Size);
++        auto vshs_lib = metal.newLibrary(vshs_data, err);
++        return vshs_lib.newFunction("vshs_main");
++      };
++
++      if (!(vshs_func_none = compile_vshs(SM50_INDEX_BUFFER_FORMAT_NONE)) ||
++          !(vshs_func_index16 = compile_vshs(SM50_INDEX_BUFFER_FORMAT_UINT16)) ||
++          !(vshs_func_index32 = compile_vshs(SM50_INDEX_BUFFER_FORMAT_UINT32)))
++        return E_FAIL;
++    }
++    {
++      auto rootsig_ds = root_signature(pDesc->DS, SM50_SHADER_ROOT_SIGNATURE, &common);
++      tessellator.next = &rootsig_ds;
++
++      SM50_SHADER_GS_PASS_THROUGH_DATA gs_passthrough;
++      gs_passthrough.type = SM50_SHADER_GS_PASS_THROUGH;
++      gs_passthrough.DataEncoded = gs_passthrough_data;
++      gs_passthrough.RasterizationDisabled = false;
++      gs_passthrough.next = &tessellator;
++
++      SM50ShaderBitcode ds_bitcode;
++      if (SM50CompileTessellationPipelineDomain(
++              shader_hs, shader_ds, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&gs_passthrough, "ds_main", &ds_bitcode,
++              &sm50_err
++          )) {
++        ERR("Failed to compile domain shader: ", SM50GetErrorMessageString(sm50_err));
++        SM50FreeError(sm50_err);
++        return E_FAIL;
++      }
++      SM50_COMPILED_BITCODE ds_bitcode_compiled;
++      SM50GetCompiledBitcode(ds_bitcode, &ds_bitcode_compiled);
++      auto ds_data = WMT::MakeDispatchData(ds_bitcode_compiled.Data, ds_bitcode_compiled.Size);
++      auto ds_lib = metal.newLibrary(ds_data, err);
++      if (!(ds_func = ds_lib.newFunction("ds_main")))
++        return E_FAIL;
++    }
++
++    WMTMeshRenderPipelineInfo info;
++    WMT::InitializeMeshRenderPipelineInfo(info);
++
++    bool dual_source_blending = false;
++    if (FAILED(hr = InitializePSO(pDesc, info, dual_source_blending)))
++      return hr;
++    if (FAILED(hr = CompilePixelShader(pDesc, info, dual_source_blending, common, ps_func)))
++      return hr;
++    if (!ps_func)
++      ps_func = device_->GetLib().getLibrary().newFunction("fs_empty");
++
++    info.mesh_function = ds_func.handle;
++    info.fragment_function = ps_func.handle;
++    info.payload_memory_length = 0;
++    // As D3D11 does on AMD GPUs: reserve the whole payload.
++    if (!metal.supportsFamily(WMTGPUFamilyApple7))
++      info.payload_memory_length = 16384;
++    // The mesh threadgroup is 32 threads, the object threadgroup threads-per-patch x patches-per-group = 32.
++    info.mesh_tgsize_is_multiple_of_sgwidth = true;
++    info.object_tgsize_is_multiple_of_sgwidth = true;
++
++    auto compile_pso = [&](WMT::Function vshs_func) -> WMT::Reference<WMT::RenderPipelineState> {
++      info.object_function = vshs_func.handle;
++      auto pso = metal.newRenderPipelineState(info, err);
++      if (!pso)
++        ERR("Failed to create tessellation PSO: ", err.description().getUTF8String());
++      return pso;
++    };
++
++    if (!(pso = compile_pso(vshs_func_none)) || !(pso_index16 = compile_pso(vshs_func_index16)) ||
++        !(pso_index32 = compile_pso(vshs_func_index32)))
++      return E_FAIL;
++
++    InitializeDSSO(pDesc);
++    InitializeRasterizerState(pDesc);
++
++    is_tessellation = true;
++    tess_threads_per_patch = ref_hs.ThreadsPerPatch;
++
++    return S_OK;
++  }
++
++  virtual WMT::RenderPipelineState
++  GetTessellationVariant(bool Indexed, WMTIndexType IndexType) {
++    if (!Indexed)
++      return pso;
++    return IndexType == WMTIndexTypeUInt16 ? pso_index16 : pso_index32;
++  }
++};
++
+ HRESULT
+ CreateGraphicsPipelineState(
+     MTLD3D12Device *pDevice, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState,
+@@ -1048,7 +1260,9 @@ CreateGraphicsPipelineState(
+ ) {
+   InitReturnPtr(ppPipelineState);
+   Com<MTLD3D12GraphicsPipelineStateImpl> pso;
+-  if (pDesc->GS.pShaderBytecode)
++  if (pDesc->HS.pShaderBytecode || pDesc->DS.pShaderBytecode)
++    pso = Com<MTLD3D12GraphicsPipelineStateImpl>(new MTLD3D12TessellationGraphicsPipelineStateImpl(pDevice));
++  else if (pDesc->GS.pShaderBytecode)
+     pso = Com<MTLD3D12GraphicsPipelineStateImpl>(new MTLD3D12GeometryGraphicsPipelineStateImpl(pDevice));
+   else
+     pso = Com(new MTLD3D12GraphicsPipelineStateImpl(pDevice));
+-- 
+2.50.1 (Apple Git-155)
+
