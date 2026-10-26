@@ -27,14 +27,18 @@ Early. It builds on a Mac and passes its smoke test (`tests/smoke.c`) under Over
 
 - **D3D10/11 and DXGI:** DXMT's, unchanged.
 - **D3D12:** feature level 12_0 on macOS 26.4 or later (tiled resources tier 2 through Metal placement
-  sparse resources; OverPass's addition), 11_1 before that. Shader model 6.0: shaders compiled for newer
-  models don't run yet.
+  sparse resources; OverPass's addition), 11_1 before that. Shader model 6.8: 26 of the 27 shader model
+  6.x features in `tests/sm6` convert (wave ops, 16-bit types, SM 6.6 resource handles and
+  `ResourceDescriptorHeap`/`SamplerDescriptorHeap`, 64-bit atomics on buffers and groupshared memory,
+  barycentrics, mesh and amplification shaders, and the 6.7/6.8 sampling ops). The one that doesn't,
+  writable MSAA textures (6.7, optional), can't be done on Metal and isn't reported. Mesh shader tier 1.
+  Not yet: 64-bit atomics on typed (`R64_UINT`) textures, raytracing, variable rate shading.
 - **DLSS → MetalFX:** Super Resolution in D3D11 and D3D12 games (D3D12 is OverPass's addition). Not yet:
   ray reconstruction and frame generation.
 - **NVAPI:** DXMT's functions plus 36 more (D3D12, driver profile sessions, D3D11 device creation,
   GPU and display queries). Active with `DXMT_ENABLE_NVEXT=1`.
 
-No releases yet, and no CI.
+Releases: see the GitHub releases page. No CI yet.
 
 ## Building
 
@@ -53,8 +57,7 @@ to `../install`.
 |---|---|
 | `dxmt/` | DXMT, pinned as a git submodule |
 | `overpass/` | `build.sh`, and OverPass's patches to DXMT in `patches/`, each described in `PATCHES.md` |
-| `tests/smoke.c` | Loads each part the way a game does and checks what it reports |
-| `.github/workflows/` | CI build, smoke test and release, as in overpass-wine (planned) |
+| `tests/` | Smoke test, runtime tests for D3D12 features (`*12.cpp` with their shaders), and `sm6/`, the shader model 6.x coverage corpus |
 
 ## License
 
