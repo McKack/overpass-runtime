@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 19:26:48 +0100
+Subject: [PATCH] airconv: non-indexed draws through a geometry shader
+
+The vertex stage of a geometry shader pipeline took the index buffer path for non-indexed draws: index_buffer_idx is ~0u when there is no index buffer, and the check tested it for non-zero, so it read a function argument that doesn't exist and the compile failed. Ghostrunner (UE4, D3D11) rendered only its HUD.
+---
+ src/airconv/dxbc_converter_gs.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/airconv/dxbc_converter_gs.cpp b/src/airconv/dxbc_converter_gs.cpp
+index d554ba6..dafc43f 100644
+--- a/src/airconv/dxbc_converter_gs.cpp
++++ b/src/airconv/dxbc_converter_gs.cpp
+@@ -790,7 +790,7 @@ convert_dxbc_vertex_for_geometry_shader(
+       builder.CreateBr(finalize_index);
+     }
+ 
+-  } else if (index_buffer_idx) {
++  } else if (index_buffer_idx != ~0u) {
+     auto start_index = builder.CreateExtractValue(draw_arguments, 2);
+     auto index_buffer = function->getArg(index_buffer_idx);
+     auto index_buffer_element_type = index_buffer->getType()->getNonOpaquePointerElementType();
+-- 
+2.50.1 (Apple Git-155)
+
