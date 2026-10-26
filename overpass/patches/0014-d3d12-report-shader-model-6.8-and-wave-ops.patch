@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 02:44:33 +0100
+Subject: [PATCH] d3d12: report shader model 6.8 and wave ops
+
+CheckFeatureSupport(SHADER_MODEL) answers any model from 5.1 to 6.9 with the
+lower of it and 6.8, as games expect when they probe, instead of failing above
+6.0. OPTIONS1 reports wave ops with 32 lanes (Metal SIMD groups on Apple GPUs).
+---
+ src/d3d12/d3d12_device.cpp | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
+index d58e286..9e67b5c 100644
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -297,9 +297,12 @@ public:
+       if (DataSize != sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
+         return E_INVALIDARG;
+       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(pFeatureData);
+-      if (out->HighestShaderModel > D3D_SHADER_MODEL_6_0)
++      // Games ask for the highest model they know and take what comes back. Everything up to 6.8 converts except
++      // writable MSAA textures (6.7, optional and not reported).
++      constexpr auto kHighest = (D3D_SHADER_MODEL)0x68, kNewestKnown = (D3D_SHADER_MODEL)0x69;
++      if (out->HighestShaderModel < D3D_SHADER_MODEL_5_1 || out->HighestShaderModel > kNewestKnown)
+         return E_INVALIDARG;
+-      out->HighestShaderModel = std::min(D3D_SHADER_MODEL_6_0, out->HighestShaderModel);
++      out->HighestShaderModel = std::min(kHighest, out->HighestShaderModel);
+       return S_OK;
+     }
+     case D3D12_FEATURE_D3D12_OPTIONS: {
+@@ -355,10 +358,11 @@ public:
+       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS1))
+         return E_INVALIDARG;
+       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS1 *>(pFeatureData);
+-      out->WaveOps = 0;
+-      out->WaveLaneCountMin = 0;
+-      out->WaveLaneCountMax = 0;
+-      out->TotalLaneCount = 0;
++      // Wave ops are Metal SIMD-group functions; Apple GPUs run 32 lanes.
++      out->WaveOps = TRUE;
++      out->WaveLaneCountMin = 32;
++      out->WaveLaneCountMax = 32;
++      out->TotalLaneCount = 1024;
+       // If CheckFeatureSupport succeeds this value will always be true.
+       out->ExpandedComputeResourceStates = TRUE;
+       out->Int64ShaderOps = TRUE;
+-- 
+2.50.1 (Apple Git-155)
+
