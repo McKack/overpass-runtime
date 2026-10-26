@@ -1,0 +1,1674 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 02:25:44 +0100
+Subject: [PATCH] airconv, d3d12: mesh and amplification shaders
+
+DXIL mesh shaders become Metal mesh functions and amplification shaders Metal
+object functions; D3D12 gets mesh pipelines from pipeline state streams,
+ID3D12GraphicsCommandList3-6 and DispatchMesh, and reports mesh shader tier 1.
+
+- Vertex and primitive outputs: the component stores of one row and vertex or
+  primitive in a block are written as one Metal mesh field (rows laid out like
+  vertex shader outputs, so pixel shaders link by name); rows written in parts
+  go through a threadgroup copy. SV_CullPrimitive -> primitive_culled.
+- The amplification shader's groupshared payload is copied to the object
+  payload by all threads at DispatchMesh, then one thread sets the mesh grid.
+- Raw/structured buffer addresses index dwords when 4-byte aligned: Metal's
+  compiler crashes on byte-indexed addresses computed from a payload value.
+- Mesh pipelines without a pixel shader get an empty fragment function.
+- Root arguments and static samplers are bound to the object and mesh stages.
+- Render passes (List4) map to render targets, clears and resolves; raytracing,
+  meta commands and shading rate are no-ops (not reported).
+- airconv -metal32.
+---
+ src/airconv/air_signature.cpp          |   7 +
+ src/airconv/air_signature.hpp          |   7 +-
+ src/airconv/airconv_cli.cpp            |   4 +-
+ src/airconv/airconv_public.h           |   9 +
+ src/airconv/dxbc_binding_rootsig.cpp   |   8 +
+ src/airconv/dxbc_converter.cpp         | 112 +++++++++
+ src/airconv/dxil_converter.cpp         | 135 +++++++++++
+ src/airconv/dxil_mesh.hpp              |  52 +++++
+ src/airconv/dxil_metadata.cpp          |  28 +++
+ src/airconv/dxil_metadata.hpp          |  18 ++
+ src/airconv/meson.build                |   1 +
+ src/airconv/nt/air_builder.cpp         |  18 ++
+ src/airconv/nt/air_builder.hpp         |   2 +
+ src/airconv/nt/dxil_converter_base.cpp |  49 ++--
+ src/airconv/nt/dxil_converter_base.hpp |  27 +++
+ src/airconv/nt/dxil_converter_mesh.cpp | 299 +++++++++++++++++++++++++
+ src/d3d12/d3d12_command_list.cpp       | 160 ++++++++++++-
+ src/d3d12/d3d12_device.cpp             |  26 ++-
+ src/d3d12/d3d12_device.hpp             |  10 +-
+ src/d3d12/d3d12_pipeline_graphics.cpp  | 204 +++++++++++++----
+ src/dxmt/dxmt_command.metal            |   3 +
+ 21 files changed, 1104 insertions(+), 75 deletions(-)
+ create mode 100644 src/airconv/dxil_mesh.hpp
+ create mode 100644 src/airconv/nt/dxil_converter_mesh.cpp
+
+diff --git a/src/airconv/air_signature.cpp b/src/airconv/air_signature.cpp
+index 1954d1d..6c73d87 100644
+--- a/src/airconv/air_signature.cpp
++++ b/src/airconv/air_signature.cpp
+@@ -631,6 +631,13 @@ auto FunctionSignatureBuilder::CreateFunction(
+                   ->string("air.arg_name")
+                   ->string("mtl_viewport_array_index");
+             },
++            [&](const OutputPrimitiveCulled) {
++              md.string("air.primitive_culled")
++                  ->string("air.arg_type_name")
++                  ->string("bool")
++                  ->string("air.arg_name")
++                  ->string("mtl_primitive_culled");
++            },
+         },
+         output
+     );
+diff --git a/src/airconv/air_signature.hpp b/src/airconv/air_signature.hpp
+index b117801..f234896 100644
+--- a/src/airconv/air_signature.hpp
++++ b/src/airconv/air_signature.hpp
+@@ -631,7 +631,12 @@ using FunctionOutput = std::variant<
+ 
+ using MeshVertexOutput = std::variant<OutputMeshData, OutputPosition, OutputClipDistance, OutputPointSize>;
+ 
+-using MeshPrimitiveOutput = std::variant<OutputMeshData, OutputRenderTargetArrayIndex, OutputViewportArrayIndex>;
++struct OutputPrimitiveCulled {
++  bool operator==(OutputPrimitiveCulled const &rhs) const { return true; }
++};
++
++using MeshPrimitiveOutput =
++    std::variant<OutputMeshData, OutputRenderTargetArrayIndex, OutputViewportArrayIndex, OutputPrimitiveCulled>;
+ 
+ class FunctionSignatureBuilder {
+ public:
+diff --git a/src/airconv/airconv_cli.cpp b/src/airconv/airconv_cli.cpp
+index 0b903d8..2ee6e6d 100644
+--- a/src/airconv/airconv_cli.cpp
++++ b/src/airconv/airconv_cli.cpp
+@@ -60,6 +60,8 @@ static cl::opt<bool> NoNativeAtomic64MinMax(
+   "no-native-atomic64-minmax", cl::init(false), cl::desc("Compile for a GPU without 64-bit atomic min/max (before Apple8)")
+ );
+ 
++static cl::opt<bool> Metal32("metal32", cl::init(false), cl::desc("Target Metal 3.2 with -rootsig"));
++
+ static cl::opt<bool> DisassembleDXBC(
+   "disas-dxbc", cl::init(false), cl::desc("Disassemble dxbc shader")
+ );
+@@ -237,7 +239,7 @@ int main(int argc, char **argv) {
+   if (NoNativeAtomic64MinMax)
+     data.flags = SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX;
+   if (UseRootSignature) {
+-    data.metal_version = SM50_SHADER_METAL_310; // as d3d12 compiles pipelines
++    data.metal_version = Metal32 ? SM50_SHADER_METAL_320 : SM50_SHADER_METAL_310; // d3d12 compiles for 3.1
+     data.next = &rootsig;
+   }
+ 
+diff --git a/src/airconv/airconv_public.h b/src/airconv/airconv_public.h
+index 3171b1f..7085a16 100644
+--- a/src/airconv/airconv_public.h
++++ b/src/airconv/airconv_public.h
+@@ -99,6 +99,14 @@ struct MTL_PIXEL_SHADER_REFLECTION {
+   uint32_t HasCoverageOutput;
+ };
+ 
++// DXIL mesh and amplification shaders (D3D12)
++struct MTL_MESH_SHADER_REFLECTION {
++  uint32_t ThreadgroupSize[3];
++  uint32_t PayloadSize;
++  uint32_t MaxVertices;   // mesh shaders
++  uint32_t MaxPrimitives; // mesh shaders
++};
++
+ struct MTL_SHADER_REFLECTION {
+   uint32_t ConstanttBufferTableBindIndex;
+   uint32_t ArgumentBufferBindIndex;
+@@ -114,6 +122,7 @@ struct MTL_SHADER_REFLECTION {
+      */
+     uint32_t PSValidRenderTargets;
+     struct MTL_PIXEL_SHADER_REFLECTION PixelShader;
++    struct MTL_MESH_SHADER_REFLECTION MeshShader;
+   };
+   uint16_t ConstantBufferSlotMask;
+   uint16_t SamplerSlotMask;
+diff --git a/src/airconv/dxbc_binding_rootsig.cpp b/src/airconv/dxbc_binding_rootsig.cpp
+index 5d4c6b7..efe6cda 100644
+--- a/src/airconv/dxbc_binding_rootsig.cpp
++++ b/src/airconv/dxbc_binding_rootsig.cpp
+@@ -401,6 +401,14 @@ setup_binding_rootsig(
+       if (shader_type == D3D10_SB_PIXEL_SHADER)
+         return true;
+       break;
++    case (D3D12_SHADER_VISIBILITY)6: // AMPLIFICATION
++      if (shader_type == D3D12_SB_AMPLIFICATION_SHADER)
++        return true;
++      break;
++    case (D3D12_SHADER_VISIBILITY)7: // MESH
++      if (shader_type == D3D12_SB_MESH_SHADER)
++        return true;
++      break;
+     default:
+       break;
+     }
+diff --git a/src/airconv/dxbc_converter.cpp b/src/airconv/dxbc_converter.cpp
+index b8ffa9d..caa62a6 100644
+--- a/src/airconv/dxbc_converter.cpp
++++ b/src/airconv/dxbc_converter.cpp
+@@ -19,6 +19,7 @@
+ #include <vector>
+ 
+ #include "dxil_converter.hpp"
++#include "dxil_mesh.hpp"
+ #include "metallib_writer.hpp"
+ #include "nt/air_builder.hpp"
+ #include "shader_common.hpp"
+@@ -812,6 +813,114 @@ llvm::Error convert_dxbc_vertex_shader(
+   return llvm::Error::success();
+ };
+ 
++// DXIL mesh (Metal mesh function) and amplification (Metal object function) shaders. The mesh's outputs are
++// declared by the shader's signature handlers and written by the DXIL converter.
++llvm::Error convert_dxil_mesh_or_amplification_shader(
++  SM50ShaderInternal *pShaderInternal, const char *name,
++  llvm::LLVMContext &context, llvm::Module &module,
++  SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
++) {
++  using namespace microsoft;
++
++  bool mesh = pShaderInternal->shader_type == D3D12_SB_MESH_SHADER;
++  auto func_signature = pShaderInternal->func_signature; // copy
++  auto shader_info = &(pShaderInternal->shader_info);
++
++  SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
++  SM50_SHADER_FLAG shader_flags = {};
++  SM50_SHADER_COMMON_DATA *sm50_common = nullptr;
++  if (args_get_data<SM50_SHADER_COMMON, SM50_SHADER_COMMON_DATA>(pArgs, &sm50_common)) {
++    metal_version = sm50_common->metal_version;
++    shader_flags = sm50_common->flags;
++  }
++  SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
++  args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
++  if (!rootsig)
++    return llvm::make_error<UnsupportedFeature>("mesh and amplification shaders need a root signature");
++
++  Prologues prologue;
++  Epilogues epilogue;
++
++  io_binding_map resource_map;
++  air::AirType types(context);
++
++  {
++    SignatureContext sig_ctx(prologue, epilogue, func_signature, resource_map);
++    for (auto &p : pShaderInternal->signature_handlers) {
++      p(sig_ctx);
++    }
++  }
++
++  auto &entry = pShaderInternal->dxil_entry;
++  if (mesh) {
++    auto *state = dxil::find_mesh_state(entry);
++    air::MeshOutputTopology topology = state->topology == 1   ? air::MeshOutputTopology::Line
++                                       : state->topology == 2 ? air::MeshOutputTopology::Triangle
++                                                              : air::MeshOutputTopology::Point;
++    if (state->payload_size)
++      func_signature.DefineInput(air::InputPayload{.size = state->payload_size});
++    func_signature.DefineInput(air::InputMesh{state->max_vertices, state->max_primitives, topology});
++  } else {
++    auto *state = dxil::find_amplification_state(entry);
++    func_signature.DefineInput(air::InputPayload{.size = std::max(state->payload_size, 4u)});
++    func_signature.DefineInput(air::InputMeshGridProperties{});
++  }
++
++  auto binding_map = setup_binding_rootsig(
++      shader_info, func_signature, module, pShaderInternal->shader_type, rootsig->bytecode, rootsig->bytecode_length
++  );
++
++  auto [function, function_metadata] =
++    func_signature.CreateFunction(name, context, module, 0, !mesh);
++
++  auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
++  auto epilogue_bb = llvm::BasicBlock::Create(context, "epilogue", function);
++  llvm::IRBuilder<> builder(entry_bb);
++  llvm::raw_null_ostream nulldbg{};
++  llvm::air::AIRBuilder air(
++      {
++          .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
++          .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
++          .noNativeAtomic64MinMax = bool(shader_flags & SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX),
++      },
++      builder, nulldbg
++  );
++
++  setup_metal_version(module, metal_version);
++
++  struct context ctx{
++      .builder = builder,
++      .air = air,
++      .binding = *binding_map,
++      .llvm = context,
++      .module = module,
++      .function = function,
++      .resource = resource_map,
++      .types = types,
++      .pso_sample_mask = 0xffffffff,
++      .shader_type = pShaderInternal->shader_type,
++      .metal_version = metal_version,
++  };
++
++  IOHelper io(air, function, types, resource_map);
++
++  if (auto err = prologue.Run(io)) {
++    return err;
++  }
++  llvm::Expected<llvm::BasicBlock *> real_entry = dxil::convert_basicblocks(entry, ctx, epilogue_bb);
++  if (auto err = real_entry.takeError()) {
++    return err;
++  }
++  builder.CreateBr(real_entry.get());
++
++  builder.SetInsertPoint(epilogue_bb);
++  builder.CreateRetVoid();
++
++  module.getOrInsertNamedMetadata(mesh ? "air.mesh" : "air.object")->addOperand(function_metadata);
++
++  return llvm::Error::success();
++};
++
+ llvm::Error convertDXBC(
+   sm50_shader_t pShader, const char *name, llvm::LLVMContext &context,
+   llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
+@@ -844,6 +953,9 @@ llvm::Error convertDXBC(
+     );
+   case microsoft::D3D12_SB_MESH_SHADER:
+   case microsoft::D3D12_SB_AMPLIFICATION_SHADER:
++    if (pShaderInternal->dxil)
++      return convert_dxil_mesh_or_amplification_shader(pShaderInternal, name, context, module, pArgs);
++    break;
+   case microsoft::D3D11_SB_RESERVED0:
+     break;
+   }
+diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
+index 950ba94..2a4e538 100644
+--- a/src/airconv/dxil_converter.cpp
++++ b/src/airconv/dxil_converter.cpp
+@@ -1,6 +1,7 @@
+ #include "dxil_converter.hpp"
+ #include "dxbc_converter.hpp"
+ #include "dxil_metadata.hpp"
++#include "dxil_mesh.hpp"
+ 
+ #include "llvm/IR/Instructions.h"
+ #include "llvm/Support/Error.h"
+@@ -642,6 +643,108 @@ initialize_pixel_signature(dxmt::dxbc::SM50ShaderInternal *shader) {
+   return llvm::Error::success();
+ }
+ 
++const MeshState *
++find_mesh_state(const EntryPoint &entry) {
++  for (auto &property : entry.properties)
++    if (property.tag == EntryPropertyTag::MSState)
++      return &property.mesh_state;
++  return nullptr;
++}
++
++const AmplificationState *
++find_amplification_state(const EntryPoint &entry) {
++  for (auto &property : entry.properties)
++    if (property.tag == EntryPropertyTag::ASState)
++      return &property.amplification_state;
++  return nullptr;
++}
++
++llvm::Expected<MeshOutputLayout>
++build_mesh_output_layout(const EntryPoint &entry) {
++  MeshOutputLayout layout;
++  int32_t vertex_data = 0, primitive_data = 0;
++  for (bool primitive : {false, true}) {
++    auto &elements = primitive ? entry.primitive_outputs : entry.outputs;
++    for (auto &element : elements) {
++      auto msl_type = to_signature_msl_type(element.component_type);
++      for (unsigned row = 0; row < element.rows; row++) {
++        MeshOutputRow out;
++        out.sig_id = element.id;
++        out.row = row;
++        out.kind = element.semantic_kind;
++        out.start_col = element.start_col < 0 ? 0 : element.start_col;
++        out.cols = element.cols;
++        switch (element.semantic_kind) {
++        case SemanticKind::Arbitrary:
++        case SemanticKind::ClipDistance:
++        case SemanticKind::CullDistance: {
++          if (!msl_type)
++            return unsupported("dxil: unsupported mesh shader output component type");
++          auto user = element_attribute_name(element, row);
++          if (!user)
++            return user.takeError();
++          out.user = *user;
++          out.type = *msl_type;
++          out.data_index = primitive ? primitive_data++ : vertex_data++;
++          if (element.semantic_kind == SemanticKind::ClipDistance) {
++            out.clip_base = layout.clip_count;
++            layout.clip_count += element.cols;
++          }
++          break;
++        }
++        case SemanticKind::Position:
++        case SemanticKind::RenderTargetArrayIndex:
++        case SemanticKind::ViewPortArrayIndex:
++        case SemanticKind::CullPrimitive:
++        case SemanticKind::PrimitiveID: // Metal's primitive_id is the primitive's index in the mesh; not written
++        case SemanticKind::ShadingRate: // no variable rate shading
++          break;
++        default:
++          return unsupported(
++              "dxil: unsupported mesh shader output semantic " + std::to_string((uint32_t)element.semantic_kind)
++          );
++        }
++        (primitive ? layout.primitive : layout.vertex).push_back(std::move(out));
++      }
++    }
++  }
++  return layout;
++}
++
++// Mesh shader outputs are written by the converter (storeVertexOutput, storePrimitiveOutput); here they're only
++// declared on the Metal mesh.
++llvm::Error
++initialize_mesh_signature(dxmt::dxbc::SM50ShaderInternal *shader) {
++  auto layout = build_mesh_output_layout(shader->dxil_entry);
++  if (!layout)
++    return layout.takeError();
++  shader->signature_handlers.push_back([layout = *layout](dxbc::SignatureContext &ctx) {
++    for (auto &out : layout.vertex) {
++      if (out.data_index >= 0)
++        ctx.func_signature.DefineMeshVertexOutput(
++            air::OutputMeshData{.user = out.user, .type = out.type, .index = (uint32_t)out.data_index}
++        );
++      if (out.kind == SemanticKind::Position)
++        ctx.func_signature.DefineMeshVertexOutput(air::OutputPosition{.type = air::msl_float4});
++    }
++    if (layout.clip_count)
++      ctx.func_signature.DefineMeshVertexOutput(air::OutputClipDistance{.count = layout.clip_count});
++    for (auto &out : layout.primitive) {
++      if (out.data_index >= 0)
++        ctx.func_signature.DefineMeshPrimitiveOutput(
++            air::OutputMeshData{.user = out.user, .type = out.type, .index = (uint32_t)out.data_index}
++        );
++      if (out.kind == SemanticKind::RenderTargetArrayIndex)
++        ctx.func_signature.DefineMeshPrimitiveOutput(air::OutputRenderTargetArrayIndex{});
++      if (out.kind == SemanticKind::ViewPortArrayIndex)
++        ctx.func_signature.DefineMeshPrimitiveOutput(air::OutputViewportArrayIndex{});
++      if (out.kind == SemanticKind::CullPrimitive)
++        ctx.func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveCulled{});
++    }
++  });
++  return llvm::Error::success();
++}
++
+ llvm::Error
+ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
+   using namespace microsoft;
+@@ -663,6 +766,24 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
+     shader->shader_type = microsoft::D3D10_SB_PIXEL_SHADER;
+     if (auto err = initialize_pixel_signature(shader))
+       return err;
++  } else if (info.shader_model.stage == "ms") {
++    shader->shader_type = microsoft::D3D12_SB_MESH_SHADER;
++    auto *state = find_mesh_state(entry);
++    if (!state)
++      return llvm::make_error<UnsupportedFeature>("dxil: mesh shader without MSState");
++    shader->threadgroup_size[0] = state->num_threads.x;
++    shader->threadgroup_size[1] = state->num_threads.y;
++    shader->threadgroup_size[2] = state->num_threads.z;
++    if (auto err = initialize_mesh_signature(shader))
++      return err;
++  } else if (info.shader_model.stage == "as") {
++    shader->shader_type = microsoft::D3D12_SB_AMPLIFICATION_SHADER;
++    auto *state = find_amplification_state(entry);
++    if (!state)
++      return llvm::make_error<UnsupportedFeature>("dxil: amplification shader without ASState");
++    shader->threadgroup_size[0] = state->num_threads.x;
++    shader->threadgroup_size[1] = state->num_threads.y;
++    shader->threadgroup_size[2] = state->num_threads.z;
+   } else {
+     return llvm::make_error<UnsupportedFeature>("dxil: unsupported shader stage " + std::string(stage));
+   }
+@@ -940,6 +1061,20 @@ initialize(
+       pRefl->ThreadgroupSize[1] = shader->threadgroup_size[1];
+       pRefl->ThreadgroupSize[2] = shader->threadgroup_size[2];
+       break;
++    case microsoft::D3D12_SB_MESH_SHADER:
++    case microsoft::D3D12_SB_AMPLIFICATION_SHADER: {
++      pRefl->MeshShader.ThreadgroupSize[0] = shader->threadgroup_size[0];
++      pRefl->MeshShader.ThreadgroupSize[1] = shader->threadgroup_size[1];
++      pRefl->MeshShader.ThreadgroupSize[2] = shader->threadgroup_size[2];
++      if (auto *ms = find_mesh_state(shader->dxil_entry)) {
++        pRefl->MeshShader.PayloadSize = ms->payload_size;
++        pRefl->MeshShader.MaxVertices = ms->max_vertices;
++        pRefl->MeshShader.MaxPrimitives = ms->max_primitives;
++      }
++      if (auto *as = find_amplification_state(shader->dxil_entry))
++        pRefl->MeshShader.PayloadSize = as->payload_size;
++      break;
++    }
+     case microsoft::D3D10_SB_PIXEL_SHADER:
+       pRefl->PixelShader.ValidRenderTargets = shader->pso_valid_output_reg_mask;
+       pRefl->PixelShader.HasCoverageOutput = shader->ps_has_coverage_output;
+diff --git a/src/airconv/dxil_mesh.hpp b/src/airconv/dxil_mesh.hpp
+new file mode 100644
+index 0000000..0aba3c5
+--- /dev/null
++++ b/src/airconv/dxil_mesh.hpp
+@@ -0,0 +1,52 @@
++/*
++ * This file is part of OverPass Runtime's additions to DXMT.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++#pragma once
++
++#include "air_signature.hpp"
++#include "dxil_metadata.hpp"
++
++#include <vector>
++
++namespace dxmt::dxil {
++
++// Where a mesh shader output row (signature element + row) goes in the Metal mesh: a user data field (a 4-wide
++// vector of the element's type, components at their register columns, like vertex shader outputs) and/or a
++// builtin.
++struct MeshOutputRow {
++  uint32_t sig_id = 0;
++  uint32_t row = 0;
++  SemanticKind kind = SemanticKind::Arbitrary;
++  int32_t data_index = -1; // OutputMeshData index, -1 for builtins only
++  std::string user;
++  air::MSLScalerOrVectorType type = air::msl_float4;
++  uint32_t start_col = 0;
++  uint32_t cols = 0;
++  uint32_t clip_base = 0; // ClipDistance: index of this row's first scalar
++};
++
++struct MeshOutputLayout {
++  std::vector<MeshOutputRow> vertex;
++  std::vector<MeshOutputRow> primitive;
++  uint32_t clip_count = 0;
++
++  const MeshOutputRow *
++  find(bool primitive_output, uint32_t sig_id, uint32_t row) const {
++    for (auto &r : primitive_output ? primitive : vertex)
++      if (r.sig_id == sig_id && r.row == row)
++        return &r;
++    return nullptr;
++  }
++};
++
++llvm::Expected<MeshOutputLayout> build_mesh_output_layout(const EntryPoint &entry);
++
++const MeshState *find_mesh_state(const EntryPoint &entry);
++const AmplificationState *find_amplification_state(const EntryPoint &entry);
++
++} // namespace dxmt::dxil
+diff --git a/src/airconv/dxil_metadata.cpp b/src/airconv/dxil_metadata.cpp
+index 04818db..fc3aba2 100644
+--- a/src/airconv/dxil_metadata.cpp
++++ b/src/airconv/dxil_metadata.cpp
+@@ -252,6 +252,27 @@ parse_property(EntryPropertyTag tag, MetadataReader r) {
+     property.num_threads = *num_threads;
+     break;
+   }
++  case EntryPropertyTag::MSState: {
++    auto num_threads = parse_num_threads(r.operand(0));
++    if (!num_threads)
++      return num_threads.takeError();
++    auto rest = r.slice(1, 4).asTuple<uint32_t, uint32_t, uint32_t, uint32_t>();
++    if (!rest)
++      return rest.takeError();
++    property.mesh_state = MeshState{*num_threads, std::get<0>(*rest), std::get<1>(*rest), std::get<2>(*rest),
++                                    std::get<3>(*rest)};
++    break;
++  }
++  case EntryPropertyTag::ASState: {
++    auto num_threads = parse_num_threads(r.operand(0));
++    if (!num_threads)
++      return num_threads.takeError();
++    auto payload = r.operand(1).asUint();
++    if (!payload)
++      return payload.takeError();
++    property.amplification_state = AmplificationState{*num_threads, *payload};
++    break;
++  }
+   default:
+     break;
+   }
+@@ -297,6 +318,13 @@ parse_entry_point(MetadataReader r) {
+     if (!outputs)
+       return outputs.takeError();
+     ep.outputs = std::move(*outputs);
++    auto count = signatures.operandCount();
++    if (count && *count > 2 && !signatures.operand(2).isNull()) {
++      auto primitive_outputs = parse_signature(signatures.operand(2));
++      if (!primitive_outputs)
++        return primitive_outputs.takeError();
++      ep.primitive_outputs = std::move(*primitive_outputs);
++    }
+   }
+ 
+   auto resources = parse_resource_group(r.operand(3));
+diff --git a/src/airconv/dxil_metadata.hpp b/src/airconv/dxil_metadata.hpp
+index ff37709..7046713 100644
+--- a/src/airconv/dxil_metadata.hpp
++++ b/src/airconv/dxil_metadata.hpp
+@@ -206,11 +206,28 @@ struct NumThreads {
+   uint32_t z = 0;
+ };
+ 
++// MSState (SM 6.5 mesh shaders); topology: 1 line, 2 triangle.
++struct MeshState {
++  NumThreads num_threads;
++  uint32_t max_vertices = 0;
++  uint32_t max_primitives = 0;
++  uint32_t topology = 0;
++  uint32_t payload_size = 0;
++};
++
++// ASState (SM 6.5 amplification shaders)
++struct AmplificationState {
++  NumThreads num_threads;
++  uint32_t payload_size = 0;
++};
++
+ struct Property {
+   EntryPropertyTag tag = EntryPropertyTag::NumThreads;
+   union {
+     uint64_t shader_flags;
+     NumThreads num_threads;
++    MeshState mesh_state;
++    AmplificationState amplification_state;
+   };
+ };
+ 
+@@ -234,6 +251,7 @@ struct EntryPoint {
+   const llvm::Function *function = nullptr;
+   std::vector<SignatureElement> inputs;
+   std::vector<SignatureElement> outputs;
++  std::vector<SignatureElement> primitive_outputs; // mesh shaders
+   std::vector<Resource> resources;
+   std::vector<Property> properties;
+ };
+diff --git a/src/airconv/meson.build b/src/airconv/meson.build
+index 6133d85..9b4e0ac 100644
+--- a/src/airconv/meson.build
++++ b/src/airconv/meson.build
+@@ -20,6 +20,7 @@ airconv_src = files([
+  'nt/dxbc_converter_base.cpp',
+  'nt/dxbc_io_helper.cpp',
+  'nt/dxil_converter_base.cpp',
++ 'nt/dxil_converter_mesh.cpp',
+  'transforms/lower_16bit_texread.cpp',
+  'transforms/simdgroup_implicit_membarrier.cpp',
+ ])
+diff --git a/src/airconv/nt/air_builder.cpp b/src/airconv/nt/air_builder.cpp
+index bf31216..e44bacb 100644
+--- a/src/airconv/nt/air_builder.cpp
++++ b/src/airconv/nt/air_builder.cpp
+@@ -1820,6 +1820,24 @@ AIRBuilder::CreateSetMeshPrimitiveCount(Value *Count) {
+   return builder.CreateCall(Fn, {getMeshHandle(), Count});
+ }
+ 
++CallInst *
++AIRBuilder::CreateSetMeshPrimitiveCulled(Value *Primitive, Value *Culled) {
++  auto &Context = getContext();
++  auto Attrs = AttributeList::get(
++      Context, {{1U, Attribute::get(Context, Attribute::AttrKind::NoCapture)},
++                {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
++                {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)},
++                {~0U, Attribute::get(Context, Attribute::AttrKind::ArgMemOnly)}}
++  );
++
++  auto Fn = getModule()->getOrInsertFunction(
++      "air.set_primitive_culled_mesh",
++      FunctionType::get(getVoidTy(), {getMeshHandleType(), getIntTy(), getBoolTy()}, false), Attrs
++  );
++
++  return builder.CreateCall(Fn, {getMeshHandle(), Primitive, Culled});
++}
++
+ CallInst *
+ AIRBuilder::CreateSetMeshPointSize(Value *Vertex, Value *Size) {
+   auto &Context = getContext();
+diff --git a/src/airconv/nt/air_builder.hpp b/src/airconv/nt/air_builder.hpp
+index 3fa6b77..41f7483 100644
+--- a/src/airconv/nt/air_builder.hpp
++++ b/src/airconv/nt/air_builder.hpp
+@@ -337,6 +337,8 @@ public:
+ 
+   CallInst *CreateSetMeshPrimitiveCount(Value *Count);
+ 
++  CallInst *CreateSetMeshPrimitiveCulled(Value *Primitive, Value *Culled);
++
+   CallInst *CreateSetMeshPointSize(Value *Vertex, Value *Size);
+ 
+   enum FPUnOp {
+diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
+index ba07587..aa506b3 100644
+--- a/src/airconv/nt/dxil_converter_base.cpp
++++ b/src/airconv/nt/dxil_converter_base.cpp
+@@ -67,6 +67,8 @@ Converter::Run(llvm::BasicBlock *ReturnBB) {
+     }
+ 
+     InitializeLocalAtomic64Locks();
++    if (auto err = InitializeMesh())
++      return err;
+ 
+     // FIXME: remove const_cast
+     for (auto &BB : *const_cast<llvm::Function *>(entry.function)) {
+@@ -834,6 +836,18 @@ Converter::EmitDxilOp(CallInst &Call) {
+   }
+   if (op == "cbufferLoadLegacy")
+     return EmitCbufferLoadLegacy(Call);
++  if (op == "storeVertexOutput")
++    return EmitMeshOutputStore(Call, false);
++  if (op == "storePrimitiveOutput")
++    return EmitMeshOutputStore(Call, true);
++  if (op == "setMeshOutputCounts")
++    return EmitSetMeshOutputCounts(Call);
++  if (op == "emitIndices")
++    return EmitEmitIndices(Call);
++  if (op.startswith("getMeshPayload")) // .struct.<payload type>
++    return EmitGetMeshPayload(Call);
++  if (op.startswith("dispatchMesh"))
++    return EmitDispatchMesh(Call);
+   if (op == "threadId")
+     return EmitThreadId(Call, ThreadBuiltin::kGlobalId);
+   if (op == "groupId")
+@@ -1355,6 +1369,25 @@ Converter::EmitGetDimensions(CallInst &Call) {
+   return Ret;
+ }
+ 
++// Address of a raw/structured buffer element. With 4-byte alignment the offset indexes dwords: Metal's compiler
++// crashes on byte-indexed addresses computed from a mesh payload value.
++llvm::Value *
++Converter::RawBufferAddress(Value *Pointer, Value *ByteOffset, Type *TyElement, uint32_t Alignment) {
++  auto AddrSpace = Pointer->getType()->getPointerAddressSpace();
++  if (Alignment >= 4 && TyElement->getPrimitiveSizeInBits() % 32 == 0)
++    return ir.CreatePointerCast(
++        ir.CreateGEP(
++            ir.getInt32Ty(), ir.CreatePointerCast(Pointer, ir.getInt32Ty()->getPointerTo(AddrSpace)),
++            {ir.CreateLShr(ByteOffset, 2)}
++        ),
++        TyElement->getPointerTo(AddrSpace)
++    );
++  return ir.CreatePointerCast(
++      ir.CreateGEP(ir.getInt8Ty(), ir.CreatePointerCast(Pointer, ir.getInt8PtrTy(AddrSpace)), {ByteOffset}),
++      TyElement->getPointerTo(AddrSpace)
++  );
++}
++
+ llvm::Expected<llvm::Value *>
+ Converter::EmitRawBufferStore(CallInst &Call) {
+   auto Handle = ResolveHandleOperand(Call.getArgOperand(1));
+@@ -1385,14 +1418,8 @@ Converter::EmitRawBufferStore(CallInst &Call) {
+     ByteOffset = ir.CreateAdd(ByteOffset, *ElementOffset);
+   }
+   bool Coherent = Buffer->GlobalCoherent && SupportsMemoryCoherency();
+-  auto BufferAddrSpace = Buffer->Pointer->getType()->getPointerAddressSpace();
+   auto *TyElement = (*Component0)->getType();
+-  auto Base = ir.CreatePointerCast(
+-      ir.CreateGEP(
+-          ir.getInt8Ty(), ir.CreatePointerCast(Buffer->Pointer, ir.getInt8PtrTy(BufferAddrSpace)), {ByteOffset}
+-      ),
+-      TyElement->getPointerTo(BufferAddrSpace)
+-  );
++  auto Base = RawBufferAddress(Buffer->Pointer, ByteOffset, TyElement, asU32(Call.getArgOperand(9)).value_or(0));
+ 
+   for (unsigned i = 0; i < 4; i++) {
+     if (!(*Mask & (1u << i)))
+@@ -1437,13 +1464,7 @@ Converter::EmitRawBufferLoad(CallInst &Call) {
+   bool Coherent = Buffer->GlobalCoherent && SupportsMemoryCoherency();
+   auto *TyStruct = cast<StructType>(MapType(Call.getType()));
+   Type *TyElement = TyStruct->getElementType(0);
+-  auto BufferAddrSpace = Buffer->Pointer->getType()->getPointerAddressSpace();
+-  auto Base = ir.CreatePointerCast(
+-      ir.CreateGEP(
+-          ir.getInt8Ty(), ir.CreatePointerCast(Buffer->Pointer, ir.getInt8PtrTy(BufferAddrSpace)), {ByteOffset}
+-      ),
+-      TyElement->getPointerTo(BufferAddrSpace)
+-  );
++  auto Base = RawBufferAddress(Buffer->Pointer, ByteOffset, TyElement, asU32(Call.getArgOperand(5)).value_or(0));
+ 
+   Value *Vector = Constant::getNullValue(FixedVectorType::get(TyElement, 4));
+   for (unsigned i = 0; i < 4; i++) {
+diff --git a/src/airconv/nt/dxil_converter_base.hpp b/src/airconv/nt/dxil_converter_base.hpp
+index 368e894..8cd7fcf 100644
+--- a/src/airconv/nt/dxil_converter_base.hpp
++++ b/src/airconv/nt/dxil_converter_base.hpp
+@@ -1,11 +1,15 @@
+ #pragma once
+ 
+ #include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/DenseSet.h"
++#include <map>
++#include <tuple>
+ #include "llvm/ADT/StringRef.h"
+ #include "llvm/IR/IRBuilder.h"
+ #include "llvm/Support/Error.h"
+ 
+ #include "../dxil_metadata.hpp"
++#include "../dxil_mesh.hpp"
+ #include "air_builder.hpp"
+ #include "dxbc_binding_map.hpp"
+ 
+@@ -62,6 +66,7 @@ private:
+   bool SupportsNonExecutionBarrier() const;
+   static llvm::air::Texture MakeTexture(const dxmt::dxbc::TextureDescirptor &Descriptor);
+   llvm::Value *BitcastIfNeeded(llvm::Value *Value, llvm::Type *Type);
++  llvm::Value *RawBufferAddress(llvm::Value *Pointer, llvm::Value *ByteOffset, llvm::Type *TyElement, uint32_t Alignment);
+   llvm::Value *BuildResRet(const llvm::CallInst &Call, llvm::Value *VecOrScalar, llvm::Value *Residency);
+   llvm::Value *MakeVec(llvm::ArrayRef<llvm::Value *> Components);
+   llvm::Value *AddOffsetIfNeeded(llvm::Value *Coord, int32_t Offset);
+@@ -126,6 +131,28 @@ private:
+       llvm::AtomicRMWInst::BinOp Op, llvm::Value *Ptr, llvm::Value *Val, llvm::Value *Compare, bool ResultUsed
+   );
+   llvm::Value *AtomicCall32(llvm::StringRef Op, llvm::Value *Ptr, llvm::ArrayRef<llvm::Value *> Args, bool Void);
++
++  // Mesh and amplification shaders (SM 6.5), see dxil_converter_mesh.cpp.
++  const MeshState *mesh_state_ = nullptr;
++  const AmplificationState *amplification_state_ = nullptr;
++  MeshOutputLayout mesh_layout_;
++  // storeVertexOutput/storePrimitiveOutput calls of one row and vertex/primitive in one block: written together at
++  // the last one when they cover the row's columns, through a threadgroup copy of the row otherwise.
++  llvm::DenseMap<const llvm::CallInst *, llvm::SmallVector<const llvm::CallInst *, 4>> mesh_store_groups_;
++  llvm::DenseSet<const llvm::CallInst *> mesh_store_deferred_;
++  std::map<std::tuple<bool, uint32_t, uint32_t>, llvm::GlobalVariable *> mesh_shadow_rows_;
++  llvm::Error InitializeMesh();
++  llvm::Value *GetPayloadArgument();
++  llvm::Type *MeshRowType(const MeshOutputRow &Row);
++  llvm::Error EmitMeshRow(
++      const MeshOutputRow &Row, bool Primitive, llvm::Value *Index,
++      llvm::ArrayRef<std::pair<uint32_t, llvm::Value *>> Components
++  );
++  llvm::Expected<llvm::Value *> EmitMeshOutputStore(const llvm::CallInst &Call, bool Primitive);
++  llvm::Expected<llvm::Value *> EmitSetMeshOutputCounts(const llvm::CallInst &Call);
++  llvm::Expected<llvm::Value *> EmitEmitIndices(const llvm::CallInst &Call);
++  llvm::Expected<llvm::Value *> EmitGetMeshPayload(const llvm::CallInst &Call);
++  llvm::Expected<llvm::Value *> EmitDispatchMesh(const llvm::CallInst &Call);
+ };
+ 
+ // Metal has 64-bit atomics only as unsigned min/max without a result, on device memory. Add/and/or/xor are split
+diff --git a/src/airconv/nt/dxil_converter_mesh.cpp b/src/airconv/nt/dxil_converter_mesh.cpp
+new file mode 100644
+index 0000000..7a3911e
+--- /dev/null
++++ b/src/airconv/nt/dxil_converter_mesh.cpp
+@@ -0,0 +1,299 @@
++/*
++ * This file is part of OverPass Runtime's additions to DXMT.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++// DXIL mesh shaders (Metal mesh functions) and amplification shaders (Metal object functions).
++
++#include "dxil_converter_base.hpp"
++
++#include "../airconv_error.hpp"
++#include "../dxbc_converter.hpp"
++#include "dxil_constants.hpp"
++
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/DerivedTypes.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/Module.h"
++
++using namespace llvm;
++using namespace llvm::air;
++
++namespace dxmt::dxil {
++
++llvm::Error unsupported(llvm::StringRef what);
++std::optional<uint32_t> asU32(Value *value);
++
++static bool
++IsDxilOp(const Instruction &Inst, StringRef Name) {
++  auto *Call = dyn_cast<CallInst>(&Inst);
++  if (!Call || !Call->getCalledFunction())
++    return false;
++  auto Callee = Call->getCalledFunction()->getName();
++  return Callee.startswith("dx.op.") && Callee.drop_front(strlen("dx.op.")).startswith(Name);
++}
++
++llvm::Error
++Converter::InitializeMesh() {
++  mesh_state_ = find_mesh_state(entry);
++  amplification_state_ = find_amplification_state(entry);
++  if (!mesh_state_)
++    return llvm::Error::success();
++  auto Layout = build_mesh_output_layout(entry);
++  if (!Layout)
++    return Layout.takeError();
++  mesh_layout_ = std::move(*Layout);
++
++  // Group the output stores of each block by row and vertex/primitive index.
++  for (auto &BB : *entry.function) {
++    std::map<std::tuple<bool, uint32_t, uint32_t, const Value *>, SmallVector<const CallInst *, 4>> Groups;
++    for (auto &Inst : BB) {
++      bool Vertex = IsDxilOp(Inst, "storeVertexOutput"), Primitive = IsDxilOp(Inst, "storePrimitiveOutput");
++      if (!Vertex && !Primitive)
++        continue;
++      auto *Call = cast<CallInst>(&Inst);
++      auto SigId = asU32(Call->getArgOperand(1)), Row = asU32(Call->getArgOperand(2));
++      if (!SigId || !Row)
++        return unsupported("dxil: non-constant mesh output row");
++      Groups[{Primitive, *SigId, *Row, Call->getArgOperand(5)}].push_back(Call);
++    }
++    for (auto &[Key, Calls] : Groups) {
++      auto *Row = mesh_layout_.find(std::get<0>(Key), std::get<1>(Key), std::get<2>(Key));
++      if (!Row)
++        return unsupported("dxil: mesh output row not in the signature");
++      uint32_t Covered = 0;
++      for (auto *Call : Calls)
++        if (auto Col = asU32(Call->getArgOperand(3)))
++          Covered |= 1u << *Col;
++      uint32_t Needed = (1u << Row->cols) - 1;
++      if ((Covered & Needed) != Needed)
++        continue; // partial row: each store goes through the threadgroup copy
++      for (auto *Call : Calls)
++        mesh_store_deferred_.insert(Call);
++      mesh_store_deferred_.erase(Calls.back());
++      mesh_store_groups_[Calls.back()] = Calls;
++    }
++  }
++  return llvm::Error::success();
++}
++
++llvm::Value *
++Converter::GetPayloadArgument() {
++  for (auto &Arg : ir.GetInsertBlock()->getParent()->args())
++    if (auto *Ty = dyn_cast<PointerType>(Arg.getType()))
++      if (Ty->getAddressSpace() == (unsigned)dxmt::air::AddressSpace::object_data)
++        return &Arg;
++  return nullptr;
++}
++
++llvm::Type *
++Converter::MeshRowType(const MeshOutputRow &Row) {
++  if (Row.kind == SemanticKind::Position)
++    return FixedVectorType::get(ir.getFloatTy(), 4);
++  return dxmt::air::get_llvm_type(Row.type, air.getContext());
++}
++
++// Writes a row's components (column, value) for one vertex or primitive.
++llvm::Error
++Converter::EmitMeshRow(
++    const MeshOutputRow &Row, bool Primitive, Value *Index, ArrayRef<std::pair<uint32_t, Value *>> Components
++) {
++  auto RowValue = [&]() -> Value * {
++    auto *Ty = cast<FixedVectorType>(MeshRowType(Row));
++    Value *Vec = UndefValue::get(Ty);
++    for (auto [Col, V] : Components)
++      Vec = ir.CreateInsertElement(Vec, BitcastIfNeeded(V, Ty->getElementType()), Row.start_col + Col);
++    return Vec;
++  };
++  auto Scalar = [&]() -> Value * { return Components.back().second; };
++
++  if (Row.data_index >= 0) {
++    if (Primitive)
++      air.CreateSetMeshPrimitiveData(Index, ir.getInt32(Row.data_index), RowValue());
++    else
++      air.CreateSetMeshVertexData(Index, ir.getInt32(Row.data_index), RowValue());
++  }
++  switch (Row.kind) {
++  case SemanticKind::Position:
++    air.CreateSetMeshPosition(Index, RowValue());
++    break;
++  case SemanticKind::ClipDistance:
++    for (auto [Col, V] : Components)
++      air.CreateSetMeshClipDistance(Index, ir.getInt32(Row.clip_base + Col), BitcastIfNeeded(V, ir.getFloatTy()));
++    break;
++  case SemanticKind::RenderTargetArrayIndex:
++    air.CreateSetMeshRenderTargetArrayIndex(Index, ir.CreateZExtOrTrunc(Scalar(), ir.getInt32Ty()));
++    break;
++  case SemanticKind::ViewPortArrayIndex:
++    air.CreateSetMeshViewportArrayIndex(Index, ir.CreateZExtOrTrunc(Scalar(), ir.getInt32Ty()));
++    break;
++  case SemanticKind::CullPrimitive: {
++    auto *V = Scalar();
++    if (!V->getType()->isIntegerTy(1))
++      V = ir.CreateICmpNE(V, Constant::getNullValue(V->getType()));
++    air.CreateSetMeshPrimitiveCulled(Index, V);
++    break;
++  }
++  default:
++    break;
++  }
++  return llvm::Error::success();
++}
++
++llvm::Expected<llvm::Value *>
++Converter::EmitMeshOutputStore(const CallInst &Call, bool Primitive) {
++  if (!mesh_state_)
++    return unsupported("dxil: mesh output outside a mesh shader");
++  if (mesh_store_deferred_.contains(&Call))
++    return (Value *)nullptr;
++  auto SigId = asU32(Call.getArgOperand(1)), Row = asU32(Call.getArgOperand(2));
++  auto *Layout = mesh_layout_.find(Primitive, *SigId, *Row);
++  auto Index = Get(Call.getArgOperand(5));
++  if (!Index)
++    return Index.takeError();
++
++  auto Group = mesh_store_groups_.find(&Call);
++  if (Group != mesh_store_groups_.end()) {
++    SmallVector<std::pair<uint32_t, Value *>, 4> Components;
++    for (auto *Store : Group->second) {
++      auto Col = asU32(Store->getArgOperand(3));
++      if (!Col)
++        return unsupported("dxil: non-constant mesh output column");
++      auto V = Get(Store->getArgOperand(4));
++      if (!V)
++        return V.takeError();
++      Components.push_back({*Col, *V});
++    }
++    if (auto err = EmitMeshRow(*Layout, Primitive, *Index, Components))
++      return std::move(err);
++    return (Value *)nullptr;
++  }
++
++  // Partial row: keep the row in threadgroup memory and write all of it each time.
++  auto Col = asU32(Call.getArgOperand(3));
++  if (!Col)
++    return unsupported("dxil: non-constant mesh output column");
++  auto V = Get(Call.getArgOperand(4));
++  if (!V)
++    return V.takeError();
++  auto *RowTy = cast<FixedVectorType>(MeshRowType(*Layout));
++  auto &Shadow = mesh_shadow_rows_[{Primitive, *SigId, *Row}];
++  if (!Shadow) {
++    auto *Ty = ArrayType::get(RowTy, Primitive ? mesh_state_->max_primitives : mesh_state_->max_vertices);
++    Shadow = new GlobalVariable(
++        *air.getModule(), Ty, false, GlobalValue::InternalLinkage, UndefValue::get(Ty), "mesh_output_row", nullptr,
++        GlobalValue::NotThreadLocal, 3
++    );
++    Shadow->setAlignment(Align(16));
++  }
++  auto *Slot = ir.CreateGEP(Shadow->getValueType(), Shadow, {ir.getInt32(0), *Index});
++  auto *Elem = ir.CreateGEP(
++      RowTy->getElementType(), ir.CreateBitCast(Slot, RowTy->getElementType()->getPointerTo(3)),
++      {ir.getInt32(Layout->start_col + *Col)}
++  );
++  ir.CreateStore(BitcastIfNeeded(*V, RowTy->getElementType()), Elem);
++  Value *Whole = ir.CreateLoad(RowTy, Slot);
++  SmallVector<std::pair<uint32_t, Value *>, 4> Components;
++  for (uint32_t C = 0; C < Layout->cols; C++)
++    Components.push_back({C, ir.CreateExtractElement(Whole, Layout->start_col + C)});
++  if (auto err = EmitMeshRow(*Layout, Primitive, *Index, Components))
++    return std::move(err);
++  return (Value *)nullptr;
++}
++
++llvm::Expected<llvm::Value *>
++Converter::EmitSetMeshOutputCounts(const CallInst &Call) {
++  // Every thread calls it with the same counts; Metal only needs the primitive count.
++  auto Primitives = Get(Call.getArgOperand(2));
++  if (!Primitives)
++    return Primitives.takeError();
++  air.CreateSetMeshPrimitiveCount(*Primitives);
++  return (Value *)nullptr;
++}
++
++llvm::Expected<llvm::Value *>
++Converter::EmitEmitIndices(const CallInst &Call) {
++  if (!mesh_state_)
++    return unsupported("dxil: emitIndices outside a mesh shader");
++  unsigned PerPrimitive = mesh_state_->topology == 1 ? 2 : mesh_state_->topology == 2 ? 3 : 1;
++  auto Primitive = Get(Call.getArgOperand(1));
++  if (!Primitive)
++    return Primitive.takeError();
++  auto *First = ir.CreateMul(*Primitive, ir.getInt32(PerPrimitive));
++  for (unsigned i = 0; i < PerPrimitive; i++) {
++    auto Vertex = Get(Call.getArgOperand(2 + i));
++    if (!Vertex)
++      return Vertex.takeError();
++    air.CreateSetMeshIndex(ir.CreateAdd(First, ir.getInt32(i)), *Vertex);
++  }
++  return (Value *)nullptr;
++}
++
++llvm::Expected<llvm::Value *>
++Converter::EmitGetMeshPayload(const CallInst &Call) {
++  auto *Payload = GetPayloadArgument();
++  if (!Payload)
++    return unsupported("dxil: mesh payload without an amplification payload");
++  auto *Ty = cast<PointerType>(Call.getType());
++  return ir.CreateBitCast(
++      Payload, MapType(Ty->getNonOpaquePointerElementType())->getPointerTo(Payload->getType()->getPointerAddressSpace())
++  );
++}
++
++// All threads call DispatchMesh once, at the end. The groupshared payload is copied to the object's payload by all
++// threads together, then one thread sets the mesh grid.
++llvm::Expected<llvm::Value *>
++Converter::EmitDispatchMesh(const CallInst &Call) {
++  if (!amplification_state_)
++    return unsupported("dxil: dispatchMesh outside an amplification shader");
++  Value *Counts[3];
++  for (unsigned i = 0; i < 3; i++) {
++    auto V = Get(Call.getArgOperand(1 + i));
++    if (!V)
++      return V.takeError();
++    Counts[i] = *V;
++  }
++  auto Source = Get(Call.getArgOperand(4));
++  if (!Source)
++    return Source.takeError();
++  auto *Payload = GetPayloadArgument();
++  if (!Payload)
++    return unsupported("dxil: amplification shader without a payload");
++
++  air.CreateBarrier(MemFlags::Threadgroup);
++  auto *Lid = air.CreateGetLocalLinearID();
++  auto &N = amplification_state_->num_threads;
++  uint32_t Threads = N.x * N.y * N.z, Words = amplification_state_->payload_size / 4;
++  auto *From = ir.CreateBitCast(*Source, ir.getInt32Ty()->getPointerTo(3));
++  auto *To = ir.CreateBitCast(Payload, ir.getInt32Ty()->getPointerTo(Payload->getType()->getPointerAddressSpace()));
++  auto *Fn = ir.GetInsertBlock()->getParent();
++  for (uint32_t Base = 0; Base < Words; Base += Threads) {
++    auto *I = ir.CreateAdd(Lid, ir.getInt32(Base));
++    auto *CopyBB = BasicBlock::Create(air.getContext(), "payload.copy", Fn);
++    auto *NextBB = BasicBlock::Create(air.getContext(), "payload.next", Fn);
++    ir.CreateCondBr(ir.CreateICmpULT(I, ir.getInt32(Words)), CopyBB, NextBB);
++    ir.SetInsertPoint(CopyBB);
++    ir.CreateStore(ir.CreateLoad(ir.getInt32Ty(), ir.CreateGEP(ir.getInt32Ty(), From, {I})),
++                   ir.CreateGEP(ir.getInt32Ty(), To, {I}));
++    ir.CreateBr(NextBB);
++    ir.SetInsertPoint(NextBB);
++  }
++
++  auto *SetBB = BasicBlock::Create(air.getContext(), "mesh.grid", Fn);
++  auto *DoneBB = BasicBlock::Create(air.getContext(), "mesh.grid.done", Fn);
++  ir.CreateCondBr(ir.CreateICmpEQ(Lid, ir.getInt32(0)), SetBB, DoneBB);
++  ir.SetInsertPoint(SetBB);
++  Value *Grid = UndefValue::get(FixedVectorType::get(ir.getInt32Ty(), 3));
++  for (unsigned i = 0; i < 3; i++)
++    Grid = ir.CreateInsertElement(Grid, Counts[i], i);
++  air.CreateSetMeshProperties(Grid);
++  ir.CreateBr(DoneBB);
++  ir.SetInsertPoint(DoneBB);
++  return (Value *)nullptr;
++}
++
++} // namespace dxmt::dxil
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index b359c56..c4252f2 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -20,6 +20,8 @@
+ #include "d3d12_interfaces.hpp"
+ #include "com/com_pointer.hpp"
+ #include "dxmt_format.hpp"
++#include <optional>
++#include <vector>
+ 
+ namespace dxmt {
+ 
+@@ -437,7 +439,9 @@ public:
+ 
+     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12DeviceChild) ||
+         riid == __uuidof(ID3D12CommandList) || riid == __uuidof(ID3D12GraphicsCommandList) ||
+-        riid == __uuidof(ID3D12GraphicsCommandList1) || riid == __uuidof(ID3D12GraphicsCommandList2)) {
++        riid == __uuidof(ID3D12GraphicsCommandList1) || riid == __uuidof(ID3D12GraphicsCommandList2) ||
++        riid == __uuidof(ID3D12GraphicsCommandList3) || riid == __uuidof(ID3D12GraphicsCommandList4) ||
++        riid == __uuidof(ID3D12GraphicsCommandList5) || riid == __uuidof(ID3D12GraphicsCommandList6)) {
+       *ppvObject = ref(this);
+       return S_OK;
+     }
+@@ -608,6 +612,8 @@ public:
+       cmd_setrs.scole_scale = pso_graphics_->scole_scale;
+       cmd_setrs.winding = pso_graphics_->winding;
+ 
++      if (pso_graphics_->mesh_pipeline)
++        dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
+       dirty_state_.clr(DirtyState::GraphicsPipelineState);
+     }
+     if (dirty_state_.test(DirtyState::VertexBuffer)) {
+@@ -635,6 +641,8 @@ public:
+         cmd_fsargbuf.buffer = allocator_->gpu_heap_buffer_;
+         cmd_fsargbuf.offset = Offset;
+         cmd_fsargbuf.index = SM50_BINDING_INDEX_ROOT_ARGUMENTS;
++        if (pso_graphics_->mesh_pipeline)
++          EncodeMeshStageBuffers(Offset, SM50_BINDING_INDEX_ROOT_ARGUMENTS);
+       }
+       dirty_state_.clr(DirtyState::GraphicsRootArguments);
+     }
+@@ -652,6 +660,8 @@ public:
+         cmd_fsargbuf.buffer = allocator_->gpu_heap_buffer_;
+         cmd_fsargbuf.offset = Offset;
+         cmd_fsargbuf.index = SM50_BINDING_INDEX_STATIC_SAMPLERS;
++        if (pso_graphics_->mesh_pipeline)
++          EncodeMeshStageBuffers(Offset, SM50_BINDING_INDEX_STATIC_SAMPLERS);
+       }
+       dirty_state_.clr(DirtyState::GraphicsRootSignature);
+     }
+@@ -730,6 +740,35 @@ public:
+     cmd_draw.vertex_count = VertexCountPerInstance;
+   };
+ 
++  // The object (amplification) and mesh stages get the same root argument / static sampler buffers.
++  void
++  EncodeMeshStageBuffers(uint64_t Offset, uint8_t Index) {
++    for (auto type : {WMTRenderCommandSetObjectBuffer, WMTRenderCommandSetMeshBuffer}) {
++      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
++      cmd.type = type;
++      cmd.buffer = allocator_->gpu_heap_buffer_;
++      cmd.offset = Offset;
++      cmd.index = Index;
++    }
++  }
++
++  void STDMETHODCALLTYPE
++  DispatchMesh(UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ) {
++    if (!pso_graphics_ || !pso_graphics_->mesh_pipeline)
++      return;
++    if (!ThreadGroupCountX || !ThreadGroupCountY || !ThreadGroupCountZ)
++      return;
++    DrawCallStatus status = PreDraw();
++    if (status == DrawCallStatus::Invalid)
++      return;
++    auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups>();
++    cmd.type = WMTRenderCommandDrawMeshThreadgroups;
++    // Without an amplification shader the grid counts mesh threadgroups (one thread per object threadgroup).
++    cmd.threadgroup_per_grid = {ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ};
++    cmd.object_threadgroup_size = pso_graphics_->object_threadgroup_size;
++    cmd.mesh_threadgroup_size = pso_graphics_->mesh_threadgroup_size;
++  }
++
+   void STDMETHODCALLTYPE
+   DrawIndexedInstanced(
+       UINT IndexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, INT BaseVertexLocation,
+@@ -1793,6 +1832,125 @@ public:
+   ) {
+     IMPLEMENT_ME
+   }
++
++  // ID3D12GraphicsCommandList3
++  void STDMETHODCALLTYPE
++  SetProtectedResourceSession(ID3D12ProtectedResourceSession *pProtectedResourceSession) {
++    if (pProtectedResourceSession)
++      WARN("SetProtectedResourceSession: protected sessions are not supported");
++  }
++
++  // ID3D12GraphicsCommandList4. Render passes become render targets, clears and resolves.
++  std::vector<D3D12_RENDER_PASS_RENDER_TARGET_DESC> render_pass_rts_;
++  std::optional<D3D12_RENDER_PASS_DEPTH_STENCIL_DESC> render_pass_ds_;
++
++  void STDMETHODCALLTYPE
++  BeginRenderPass(
++      UINT NumRenderTargets, const D3D12_RENDER_PASS_RENDER_TARGET_DESC *pRenderTargets,
++      const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC *pDepthStencil, D3D12_RENDER_PASS_FLAGS Flags
++  ) {
++    render_pass_rts_.assign(pRenderTargets, pRenderTargets + NumRenderTargets);
++    render_pass_ds_.reset();
++    if (pDepthStencil)
++      render_pass_ds_ = *pDepthStencil;
++    D3D12_CPU_DESCRIPTOR_HANDLE rtvs[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
++    for (UINT i = 0; i < NumRenderTargets && i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
++      rtvs[i] = pRenderTargets[i].cpuDescriptor;
++    D3D12_CPU_DESCRIPTOR_HANDLE dsv = pDepthStencil ? pDepthStencil->cpuDescriptor : D3D12_CPU_DESCRIPTOR_HANDLE{};
++    OMSetRenderTargets(NumRenderTargets, rtvs, FALSE, dsv.ptr ? &dsv : nullptr);
++    for (UINT i = 0; i < NumRenderTargets; i++) {
++      auto &access = pRenderTargets[i].BeginningAccess;
++      if (access.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR && pRenderTargets[i].cpuDescriptor.ptr)
++        ClearRenderTargetView(pRenderTargets[i].cpuDescriptor, access.Clear.ClearValue.Color, 0, nullptr);
++    }
++    if (pDepthStencil && dsv.ptr) {
++      D3D12_CLEAR_FLAGS clear = {};
++      if (pDepthStencil->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
++        clear |= D3D12_CLEAR_FLAG_DEPTH;
++      if (pDepthStencil->StencilBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
++        clear |= D3D12_CLEAR_FLAG_STENCIL;
++      if (clear)
++        ClearDepthStencilView(
++            dsv, clear, pDepthStencil->DepthBeginningAccess.Clear.ClearValue.DepthStencil.Depth,
++            pDepthStencil->StencilBeginningAccess.Clear.ClearValue.DepthStencil.Stencil, 0, nullptr
++        );
++    }
++  }
++
++  void
++  EndRenderPassResolve(const D3D12_RENDER_PASS_ENDING_ACCESS &access) {
++    if (access.Type != D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE)
++      return;
++    auto &resolve = access.Resolve;
++    for (UINT i = 0; i < resolve.SubresourceCount; i++) {
++      auto &sub = resolve.pSubresourceParameters[i];
++      ResolveSubresource(resolve.pDstResource, sub.DstSubresource, resolve.pSrcResource, sub.SrcSubresource, resolve.Format);
++    }
++  }
++
++  void STDMETHODCALLTYPE
++  EndRenderPass() {
++    for (auto &rt : render_pass_rts_)
++      EndRenderPassResolve(rt.EndingAccess);
++    if (render_pass_ds_) {
++      EndRenderPassResolve(render_pass_ds_->DepthEndingAccess);
++      EndRenderPassResolve(render_pass_ds_->StencilEndingAccess);
++    }
++    render_pass_rts_.clear();
++    render_pass_ds_.reset();
++  }
++
++  void STDMETHODCALLTYPE
++  InitializeMetaCommand(ID3D12MetaCommand *pMetaCommand, const void *pData, SIZE_T DataSize) {
++    WARN("InitializeMetaCommand: meta commands are not supported");
++  }
++
++  void STDMETHODCALLTYPE
++  ExecuteMetaCommand(ID3D12MetaCommand *pMetaCommand, const void *pData, SIZE_T DataSize) {
++    WARN("ExecuteMetaCommand: meta commands are not supported");
++  }
++
++  // Raytracing isn't reported (no OPTIONS5 raytracing tier), so these aren't expected to be called.
++  void STDMETHODCALLTYPE
++  BuildRaytracingAccelerationStructure(
++      const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC *pDesc, UINT NumPostbuildInfoDescs,
++      const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *pPostbuildInfoDescs
++  ) {
++    IMPLEMENT_ME
++  }
++
++  void STDMETHODCALLTYPE
++  EmitRaytracingAccelerationStructurePostbuildInfo(
++      const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *pDesc, UINT NumSourceAccelerationStructures,
++      const D3D12_GPU_VIRTUAL_ADDRESS *pSourceAccelerationStructureData
++  ) {
++    IMPLEMENT_ME
++  }
++
++  void STDMETHODCALLTYPE
++  CopyRaytracingAccelerationStructure(
++      D3D12_GPU_VIRTUAL_ADDRESS DestAccelerationStructureData, D3D12_GPU_VIRTUAL_ADDRESS SourceAccelerationStructureData,
++      D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE Mode
++  ) {
++    IMPLEMENT_ME
++  }
++
++  void STDMETHODCALLTYPE
++  SetPipelineState1(ID3D12StateObject *pStateObject) {
++    IMPLEMENT_ME
++  }
++
++  void STDMETHODCALLTYPE
++  DispatchRays(const D3D12_DISPATCH_RAYS_DESC *pDesc) {
++    IMPLEMENT_ME
++  }
++
++  // ID3D12GraphicsCommandList5: variable rate shading isn't reported (OPTIONS6), the base rate is all there is.
++  void STDMETHODCALLTYPE
++  RSSetShadingRate(D3D12_SHADING_RATE BaseShadingRate, const D3D12_SHADING_RATE_COMBINER *pCombiners) {}
++
++  void STDMETHODCALLTYPE
++  RSSetShadingRateImage(ID3D12Resource *pShadingRateImage) {}
+ };
+ 
+ HRESULT STDMETHODCALLTYPE
+diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
+index c9f3f2a..d58e286 100644
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -387,7 +387,7 @@ public:
+       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7))
+         return E_INVALIDARG;
+       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7 *>(pFeatureData);
+-      out->MeshShaderTier = D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
++      out->MeshShaderTier = D3D12_MESH_SHADER_TIER_1; // Metal mesh and object functions
+       out->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
+       return S_OK;
+     }
+@@ -946,6 +946,7 @@ public:
+ 
+     D3D12_COMPUTE_PIPELINE_STATE_DESC desc_cs{};
+     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc_graphics{};
++    D3D12_SHADER_BYTECODE desc_as{}, desc_ms{};
+     {
+       desc_graphics.DepthStencilState.DepthEnable = TRUE;
+       desc_graphics.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+@@ -1127,18 +1128,12 @@ public:
+       }
+       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: {
+         GET_STREAM_DATA(D3D12_SHADER_BYTECODE);
+-        if (subobject->data.pShaderBytecode) {
+-          ERR("CreatePipelineState: unsupported AS");
+-          return E_NOTIMPL;
+-        }
++        desc_as = subobject->data;
+         break;
+       }
+       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: {
+         GET_STREAM_DATA(D3D12_SHADER_BYTECODE);
+-        if (subobject->data.pShaderBytecode) {
+-          ERR("CreatePipelineState: unsupported MS");
+-          return E_NOTIMPL;
+-        }
++        desc_ms = subobject->data;
+         break;
+       }
+       default:
+@@ -1158,6 +1153,19 @@ public:
+       return CreateComputePipelineState(&desc_cs, riid, ppPipelineState);
+     }
+ 
++    if (desc_ms.pShaderBytecode) {
++      if (desc_graphics.VS.pShaderBytecode || desc_graphics.GS.pShaderBytecode || desc_graphics.HS.pShaderBytecode ||
++          desc_graphics.DS.pShaderBytecode) {
++        ERR("CreatePipelineState: mesh shader with vertex pipeline stages");
++        return E_INVALIDARG;
++      }
++      return dxmt::CreateGraphicsPipelineState(this, &desc_graphics, riid, ppPipelineState, &desc_as, &desc_ms);
++    }
++    if (desc_as.pShaderBytecode) {
++      ERR("CreatePipelineState: amplification shader without a mesh shader");
++      return E_INVALIDARG;
++    }
++
+     return CreateGraphicsPipelineState(&desc_graphics, riid, ppPipelineState);
+   }
+ 
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index 0d67b3d..8c65e17 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -41,7 +41,7 @@
+ 
+ namespace dxmt {
+ 
+-class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandList2 {
++class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandList6 {
+ public:
+   EncoderData *entry;
+   size_t encoder_count;
+@@ -154,6 +154,10 @@ public:
+   float scole_scale;
+   float depth_bias_clamp;
+   uint32_t forced_sample_count;
++  // Mesh pipelines (DispatchMesh): threads per object (amplification) and mesh threadgroup.
++  bool mesh_pipeline = false;
++  WMTSize object_threadgroup_size = {1, 1, 1};
++  WMTSize mesh_threadgroup_size = {1, 1, 1};
+ 
+   virtual WMT::DepthStencilState GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) = 0;
+ 
+@@ -280,9 +284,11 @@ CreateCommandSignature(
+     REFIID riid, void **ppCommandSignature
+ );
+ 
++// pAS/pMS: amplification and mesh shaders from a pipeline state stream (a mesh pipeline when pMS has bytecode).
+ HRESULT
+ CreateGraphicsPipelineState(
+-    MTLD3D12Device *pDevice, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState
++    MTLD3D12Device *pDevice, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState,
++    const D3D12_SHADER_BYTECODE *pAS = nullptr, const D3D12_SHADER_BYTECODE *pMS = nullptr
+ );
+ 
+ HRESULT
+diff --git a/src/d3d12/d3d12_pipeline_graphics.cpp b/src/d3d12/d3d12_pipeline_graphics.cpp
+index 54da527..e12c047 100644
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -461,6 +461,156 @@ public:
+     forced_sample_count = pDesc->RasterizerState.ForcedSampleCount;
+   }
+ 
++  template <typename RenderPipelineInfo>
++  HRESULT
++  CompilePixelShader(
++      const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, RenderPipelineInfo &info, bool dual_source_blending,
++      SM50_SHADER_COMMON_DATA &common, WMT::Reference<WMT::Function> &ps_func
++  ) {
++    if (!pDesc->PS.pShaderBytecode)
++      return S_OK;
++    HRESULT hr;
++    SM50Shader shader_ps;
++    SM50Error sm50_err;
++    auto metal = device_->GetMTLDevice();
++    WMT::Reference<WMT::Error> err;
++    auto sha1 = Sha1HashState::compute(pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength);
++
++    std::string ps_name = "ps_main" + sha1.string().substr(0, 8);
++
++    if (FAILED(hr = InitializeShader(pDesc->PS, &shader_ps, &ref_ps)))
++      return hr;
++    SM50_SHADER_PSO_PIXEL_SHADER_DATA data_ps;
++    data_ps.dual_source_blending = dual_source_blending;
++    data_ps.disable_depth_output = false;
++    data_ps.unorm_output_reg_mask = 0;
++    data_ps.sample_mask = pDesc->SampleMask;
++    data_ps.type = SM50_SHADER_PSO_PIXEL_SHADER;
++    data_ps.next = &common;
++
++    memset(data_ps.pixel_formats, 0, sizeof(data_ps.pixel_formats));
++    for (unsigned i = 0; i < pDesc->NumRenderTargets; i++) {
++      data_ps.pixel_formats[i] = ORIGINAL_FORMAT(info.colors[i].pixel_format);
++    }
++
++    SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
++    rootsig.type = SM50_SHADER_ROOT_SIGNATURE;
++    if (pDesc->pRootSignature) {
++      rootsig.bytecode_length =
++          static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature)->GetBlob(&rootsig.bytecode);
++    } else {
++      rootsig.bytecode = pDesc->PS.pShaderBytecode;
++      rootsig.bytecode_length = pDesc->PS.BytecodeLength;
++    }
++    rootsig.next = &data_ps;
++
++    SM50ShaderBitcode ps_bitcode;
++    if (SM50Compile(
++            shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(), &ps_bitcode, &sm50_err
++        )) {
++      ERR("Failed to compile ps shader: ", SM50GetErrorMessageString(sm50_err));
++      return E_FAIL;
++    }
++    SM50_COMPILED_BITCODE ps_bitcode_compiled;
++    SM50GetCompiledBitcode(ps_bitcode, &ps_bitcode_compiled);
++    auto ps_data = WMT::MakeDispatchData(ps_bitcode_compiled.Data, ps_bitcode_compiled.Size);
++    auto ps_lib = metal.newLibrary(ps_data, err);
++    ps_func = ps_lib.newFunction(ps_name.c_str());
++    return S_OK;
++  }
++
++  // A DXIL mesh or amplification shader as the Metal mesh or object function.
++  HRESULT
++  CompileMeshStage(
++      const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, const D3D12_SHADER_BYTECODE &Bytecode, const char *Name,
++      SM50_SHADER_COMMON_DATA &common, MTL_SHADER_REFLECTION &Reflection, WMT::Reference<WMT::Function> &Function
++  ) {
++    HRESULT hr;
++    SM50Shader shader;
++    SM50Error sm50_err;
++    WMT::Reference<WMT::Error> err;
++    if (FAILED(hr = InitializeShader(Bytecode, &shader, &Reflection)))
++      return hr;
++    SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
++    rootsig.type = SM50_SHADER_ROOT_SIGNATURE;
++    if (pDesc->pRootSignature) {
++      rootsig.bytecode_length = static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature)->GetBlob(&rootsig.bytecode);
++    } else {
++      rootsig.bytecode = Bytecode.pShaderBytecode;
++      rootsig.bytecode_length = Bytecode.BytecodeLength;
++    }
++    rootsig.next = &common;
++    SM50ShaderBitcode bitcode;
++    if (SM50Compile(shader, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, Name, &bitcode, &sm50_err)) {
++      ERR("Failed to compile ", Name, ": ", SM50GetErrorMessageString(sm50_err));
++      return E_FAIL;
++    }
++    SM50_COMPILED_BITCODE compiled;
++    SM50GetCompiledBitcode(bitcode, &compiled);
++    auto data = WMT::MakeDispatchData(compiled.Data, compiled.Size);
++    auto lib = device_->GetMTLDevice().newLibrary(data, err);
++    if (!lib) {
++      ERR("Failed to load ", Name, ": ", err.description().getUTF8String());
++      return E_FAIL;
++    }
++    Function = lib.newFunction(Name);
++    return S_OK;
++  }
++
++  HRESULT
++  InitializeMesh(
++      const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, const D3D12_SHADER_BYTECODE &AS, const D3D12_SHADER_BYTECODE &MS
++  ) {
++    HRESULT hr;
++    SM50_SHADER_COMMON_DATA common;
++    common.flags = device_->GetMTLDevice().supportsFamily(WMTGPUFamilyApple8)
++                       ? SM50_SHADER_FLAG{}
++                       : SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX;
++    common.type = SM50_SHADER_COMMON;
++    common.metal_version = SM50_SHADER_METAL_310;
++    common.next = nullptr;
++
++    WMT::Reference<WMT::Function> as_func, ms_func, ps_func;
++    MTL_SHADER_REFLECTION ref_as{}, ref_ms{};
++    if (FAILED(hr = CompileMeshStage(pDesc, MS, "ms_main", common, ref_ms, ms_func)))
++      return hr;
++    if (AS.pShaderBytecode && FAILED(hr = CompileMeshStage(pDesc, AS, "as_main", common, ref_as, as_func)))
++      return hr;
++
++    WMTMeshRenderPipelineInfo info;
++    WMT::InitializeMeshRenderPipelineInfo(info);
++    bool dual_source_blending = false;
++    if (FAILED(hr = InitializePSO(pDesc, info, dual_source_blending)))
++      return hr;
++    if (FAILED(hr = CompilePixelShader(pDesc, info, dual_source_blending, common, ps_func)))
++      return hr;
++
++    if (!ps_func)
++      ps_func = device_->GetLib().getLibrary().newFunction("fs_empty");
++    info.mesh_function = ms_func.handle;
++    info.object_function = as_func.handle;
++    info.fragment_function = ps_func.handle;
++    info.payload_memory_length = AS.pShaderBytecode ? std::max(ref_as.MeshShader.PayloadSize, 4u) : 0;
++
++    WMT::Reference<WMT::Error> err;
++    pso = device_->GetMTLDevice().newRenderPipelineState(info, err);
++    if (!pso) {
++      ERR("Failed to create mesh PSO: ", err.description().getUTF8String());
++      return E_FAIL;
++    }
++    mesh_pipeline = true;
++    auto size = [](const MTL_SHADER_REFLECTION &r) {
++      return WMTSize{r.MeshShader.ThreadgroupSize[0], r.MeshShader.ThreadgroupSize[1], r.MeshShader.ThreadgroupSize[2]};
++    };
++    mesh_threadgroup_size = size(ref_ms);
++    if (AS.pShaderBytecode)
++      object_threadgroup_size = size(ref_as);
++
++    InitializeDSSO(pDesc);
++    InitializeRasterizerState(pDesc);
++    return S_OK;
++  }
++
+   virtual HRESULT
+   Initialize(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
+     if (pDesc->StreamOutput.NumEntries) {
+@@ -480,7 +630,7 @@ public:
+ 
+     HRESULT hr;
+ 
+-    SM50Shader shader_vs, shader_ps;
++    SM50Shader shader_vs;
+     SM50Error sm50_err;
+     auto metal = device_->GetMTLDevice();
+     WMT::Reference<WMT::Error> err;
+@@ -556,50 +706,8 @@ public:
+     if (FAILED(hr = InitializePSO(pDesc, info, dual_source_blending)))
+       return hr;
+ 
+-    if (pDesc->PS.pShaderBytecode) {
+-      auto sha1 = Sha1HashState::compute(pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength);
+-
+-      std::string ps_name = "ps_main" + sha1.string().substr(0, 8);
+-
+-      if (FAILED(hr = InitializeShader(pDesc->PS, &shader_ps, &ref_ps)))
+-        return hr;
+-      SM50_SHADER_PSO_PIXEL_SHADER_DATA data_ps;
+-      data_ps.dual_source_blending = dual_source_blending;
+-      data_ps.disable_depth_output = false;
+-      data_ps.unorm_output_reg_mask = 0;
+-      data_ps.sample_mask = pDesc->SampleMask;
+-      data_ps.type = SM50_SHADER_PSO_PIXEL_SHADER;
+-      data_ps.next = &common;
+-
+-      memset(data_ps.pixel_formats, 0, sizeof(data_ps.pixel_formats));
+-      for (unsigned i = 0; i < pDesc->NumRenderTargets; i++) {
+-        data_ps.pixel_formats[i] = ORIGINAL_FORMAT(info.colors[i].pixel_format);
+-      }
+-
+-      SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
+-      rootsig.type = SM50_SHADER_ROOT_SIGNATURE;
+-      if (pDesc->pRootSignature) {
+-        rootsig.bytecode_length =
+-            static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature)->GetBlob(&rootsig.bytecode);
+-      } else {
+-        rootsig.bytecode = pDesc->PS.pShaderBytecode;
+-        rootsig.bytecode_length = pDesc->PS.BytecodeLength;
+-      }
+-      rootsig.next = &data_ps;
+-
+-      SM50ShaderBitcode ps_bitcode;
+-      if (SM50Compile(
+-              shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(), &ps_bitcode, &sm50_err
+-          )) {
+-        ERR("Failed to compile ps shader: ", SM50GetErrorMessageString(sm50_err));
+-        return E_FAIL;
+-      }
+-      SM50_COMPILED_BITCODE ps_bitcode_compiled;
+-      SM50GetCompiledBitcode(ps_bitcode, &ps_bitcode_compiled);
+-      auto ps_data = WMT::MakeDispatchData(ps_bitcode_compiled.Data, ps_bitcode_compiled.Size);
+-      auto ps_lib = metal.newLibrary(ps_data, err);
+-      ps_func = ps_lib.newFunction(ps_name.c_str());
+-    }
++    if (FAILED(hr = CompilePixelShader(pDesc, info, dual_source_blending, common, ps_func)))
++      return hr;
+ 
+     // PSO
+     {
+@@ -678,11 +786,13 @@ public:
+ 
+ HRESULT
+ CreateGraphicsPipelineState(
+-    MTLD3D12Device *pDevice, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState
++    MTLD3D12Device *pDevice, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState,
++    const D3D12_SHADER_BYTECODE *pAS, const D3D12_SHADER_BYTECODE *pMS
+ ) {
+   InitReturnPtr(ppPipelineState);
+   auto pso = Com(new MTLD3D12GraphicsPipelineStateImpl(pDevice));
+-  HRESULT hr = pso->Initialize(pDesc);
++  HRESULT hr = pMS && pMS->pShaderBytecode ? pso->InitializeMesh(pDesc, pAS ? *pAS : D3D12_SHADER_BYTECODE{}, *pMS)
++                                           : pso->Initialize(pDesc);
+   if (FAILED(hr))
+     return hr;
+   return pso->QueryInterface(riid, ppPipelineState);
+diff --git a/src/dxmt/dxmt_command.metal b/src/dxmt/dxmt_command.metal
+index 516f49e..508b5d6 100644
+--- a/src/dxmt/dxmt_command.metal
++++ b/src/dxmt/dxmt_command.metal
+@@ -210,6 +210,9 @@ struct clear_data {
+   return output;
+ }
+ 
++// Mesh pipelines without a pixel shader (D3D12 allows them, Metal needs a fragment function).
++[[fragment]] void fs_empty() {}
++
+ [[fragment]] float4 fs_clear_rt_float(
+   constant float4& clear_value [[buffer(kCustomBufferArgumentIndex0)]]
+ ) {
+-- 
+2.54.0 (Apple Git-157)
+

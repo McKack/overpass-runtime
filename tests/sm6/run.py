@@ -19,6 +19,7 @@ def compile(name, prof, extra):
     open(f"{C}/log/{name}.dxc", "w").write(r.stdout + r.stderr)
     return out if os.path.exists(out) and os.path.getsize(out) else None
 uvs, ups = compile("uni_vs", "vs_6_0", []), compile("uni_ps", "ps_6_0", [])
+ums = compile("uni_ms", "ms_6_5", [])
 results = []
 for line in open(C + "/list.txt"):
     parts = shlex.split(line.replace('"', ''))
@@ -33,6 +34,8 @@ for line in open(C + "/list.txt"):
         args = [wine, S + "/smoke/sm6pso.exe"]
         if stage == "vs": args += ["vs", win(cso), win(ups)]
         elif stage == "ps": args += ["ps", win(cso), win(uvs)]
+        elif stage == "ms": args += ["ms", win(cso)]
+        elif stage == "as": args += ["as", win(cso), win(ums)]
         else: args += ["cs", win(cso)]
         try:
             r = subprocess.run(args, env=env, capture_output=True, text=True, timeout=120)
