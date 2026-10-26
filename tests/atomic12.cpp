@@ -1,6 +1,7 @@
 /* OverPass Runtime: 64-bit atomics (SM 6.6), end to end. Runs tests/atomic12.hlsl compiled with DXC (cs_6_6) once
- * as atomic12_split.cso (-DSPLIT: the lock-free paths) and once as atomic12.cso (everything, through the lock
- * words), 16 groups of 64 threads, and checks the buffer. */
+ * as atomic12_split.cso (-DSPLIT: the lock-free paths), as atomic12.cso (everything, through the lock words) and
+ * as atomic12_heap.cso (-DHEAP: the same with the buffer from ResourceDescriptorHeap), 16 groups of 64 threads, and
+ * checks the buffer. */
 #include <windows.h>
 #include <d3d12.h>
 #include <stdio.h>
@@ -11,7 +12,7 @@ static int failures;
 
 static const UINT kSize = 128 + 1024 * 8;
 
-static bool run(ID3D12Device *dev, const char *path, bool split)
+static bool run(ID3D12Device *dev, const char *path, bool split, bool heap = false)
 {
     std::vector<char> cso;
     if (FILE *f = fopen(path, "rb")) { fseek(f, 0, SEEK_END); cso.resize(ftell(f)); fseek(f, 0, SEEK_SET); fread(cso.data(), 1, cso.size(), f); fclose(f); }
@@ -51,7 +52,17 @@ static bool run(ID3D12Device *dev, const char *path, bool split)
     list->ResourceBarrier(1, &b);
     list->SetComputeRootSignature(rs);
     list->SetPipelineState(pso);
-    list->SetComputeRootUnorderedAccessView(0, buf->GetGPUVirtualAddress());
+    if (heap) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+        ID3D12DescriptorHeap *dh;
+        dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dh));
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav = { DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER };
+        uav.Buffer = { 0, kSize / 4, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW };
+        dev->CreateUnorderedAccessView(buf, nullptr, &uav, dh->GetCPUDescriptorHandleForHeapStart());
+        list->SetDescriptorHeaps(1, &dh);
+    } else {
+        list->SetComputeRootUnorderedAccessView(0, buf->GetGPUVirtualAddress());
+    }
     list->Dispatch(16, 1, 1);
     b.Transition = { buf, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE };
     list->ResourceBarrier(1, &b);
@@ -94,6 +105,8 @@ int main(int argc, char **argv)
     run(dev, argc > 2 ? argv[2] : "atomic12_split.cso", true);
     printf("-- everything through the lock words\n");
     run(dev, argc > 1 ? argv[1] : "atomic12.cso", false);
+    printf("-- the same through the descriptor heap\n");
+    run(dev, argc > 3 ? argv[3] : "atomic12_heap.cso", false, true);
     printf("%d failure(s)\n", failures);
     return failures;
 }

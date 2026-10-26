@@ -1,0 +1,335 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 01:37:31 +0100
+Subject: [PATCH] airconv, d3d12: 64-bit atomic min/max without Metal's native
+ one; heap resources
+
+Metal's 64-bit atomic min/max needs Apple8 (M2) or later. D3D12 pipelines now
+pass SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX on older GPUs, and the converter
+then takes the lock word for them like for the other 64-bit atomics. Any shader
+with 64-bit buffer atomics gets the lock table bound; whether it's used is
+decided at compile time.
+
+OPTIONS11 reports AtomicInt64OnDescriptorHeapResourceSupported: heap buffers
+reach the same lock table. airconv -no-native-atomic64-minmax compiles as for
+such a GPU.
+---
+ src/airconv/airconv_cli.cpp            |  6 ++++++
+ src/airconv/airconv_public.h           |  2 ++
+ src/airconv/dxbc_converter.cpp         |  3 +++
+ src/airconv/dxbc_converter.hpp         |  2 +-
+ src/airconv/dxbc_converter_gs.cpp      |  2 ++
+ src/airconv/dxbc_converter_ts.cpp      |  2 ++
+ src/airconv/dxil_converter.cpp         |  2 +-
+ src/airconv/nt/air_builder.hpp         |  6 ++++++
+ src/airconv/nt/dxil_converter_base.cpp | 20 +++++++++++---------
+ src/airconv/nt/dxil_converter_base.hpp | 10 +++++++---
+ src/d3d12/d3d12_device.cpp             |  3 ++-
+ src/d3d12/d3d12_pipeline_compute.cpp   |  5 ++++-
+ src/d3d12/d3d12_pipeline_graphics.cpp  |  5 ++++-
+ 13 files changed, 51 insertions(+), 17 deletions(-)
+
+diff --git a/src/airconv/airconv_cli.cpp b/src/airconv/airconv_cli.cpp
+index 7f08bb5..0b903d8 100644
+--- a/src/airconv/airconv_cli.cpp
++++ b/src/airconv/airconv_cli.cpp
+@@ -56,6 +56,10 @@ static cl::opt<bool> UseRootSignature(
+   "rootsig", cl::init(false), cl::desc("Bind resources through the root signature embedded in the input (D3D12)")
+ );
+ 
++static cl::opt<bool> NoNativeAtomic64MinMax(
++  "no-native-atomic64-minmax", cl::init(false), cl::desc("Compile for a GPU without 64-bit atomic min/max (before Apple8)")
++);
++
+ static cl::opt<bool> DisassembleDXBC(
+   "disas-dxbc", cl::init(false), cl::desc("Disassemble dxbc shader")
+ );
+@@ -230,6 +234,8 @@ int main(int argc, char **argv) {
+   rootsig.bytecode = MemRef.getBufferStart();
+   rootsig.bytecode_length = MemRef.getBufferSize();
+   rootsig.next = nullptr;
++  if (NoNativeAtomic64MinMax)
++    data.flags = SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX;
+   if (UseRootSignature) {
+     data.metal_version = SM50_SHADER_METAL_310; // as d3d12 compiles pipelines
+     data.next = &rootsig;
+diff --git a/src/airconv/airconv_public.h b/src/airconv/airconv_public.h
+index e167ae4..3171b1f 100644
+--- a/src/airconv/airconv_public.h
++++ b/src/airconv/airconv_public.h
+@@ -237,6 +237,8 @@ enum SM50_SHADER_METAL_VERSION {
+ enum SM50_SHADER_FLAG {
+   SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO = 1 << 0,
+   SM50_SHADER_FLAG_DEFUSE_FMA = 1 << 1,
++  // The GPU lacks Metal's 64-bit atomic min/max (Apple8 and later).
++  SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX = 1 << 2,
+ };
+ 
+ struct SM50_SHADER_COMMON_DATA {
+diff --git a/src/airconv/dxbc_converter.cpp b/src/airconv/dxbc_converter.cpp
+index 8b569d5..b8ffa9d 100644
+--- a/src/airconv/dxbc_converter.cpp
++++ b/src/airconv/dxbc_converter.cpp
+@@ -390,6 +390,7 @@ llvm::Error convert_dxbc_pixel_shader(
+       {
+           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
+           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
++          .noNativeAtomic64MinMax = bool(shader_flags & SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX),
+       },
+       builder, nulldbg
+   );
+@@ -513,6 +514,7 @@ llvm::Error convert_dxbc_compute_shader(
+       {
+           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
+           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
++          .noNativeAtomic64MinMax = bool(shader_flags & SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX),
+       },
+       builder, nulldbg
+   );
+@@ -678,6 +680,7 @@ llvm::Error convert_dxbc_vertex_shader(
+       {
+           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
+           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
++          .noNativeAtomic64MinMax = bool(shader_flags & SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX),
+       },
+       builder, nulldbg
+   );
+diff --git a/src/airconv/dxbc_converter.hpp b/src/airconv/dxbc_converter.hpp
+index bb13a66..abe2fb3 100644
+--- a/src/airconv/dxbc_converter.hpp
++++ b/src/airconv/dxbc_converter.hpp
+@@ -105,7 +105,7 @@ public:
+   bool output_control_point_read = false;
+   bool use_msad = false;
+   bool use_samplepos = false;
+-  bool use_atomic64_locks = false; // 64-bit device atomics that need the lock table
++  bool use_atomic64_locks = false; // 64-bit device atomics: the lock table is bound
+   std::vector<PhaseInfo> phases;
+   uint32_t pull_mode_reg_mask = 0;
+ };
+diff --git a/src/airconv/dxbc_converter_gs.cpp b/src/airconv/dxbc_converter_gs.cpp
+index 17ac78f..7bd3a87 100644
+--- a/src/airconv/dxbc_converter_gs.cpp
++++ b/src/airconv/dxbc_converter_gs.cpp
+@@ -178,6 +178,7 @@ convert_dxbc_geometry_shader(
+       {
+           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
+           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
++          .noNativeAtomic64MinMax = bool(shader_flags & SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX),
+       },
+       builder, nulldbg
+   );
+@@ -605,6 +606,7 @@ convert_dxbc_vertex_for_geometry_shader(
+       {
+           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
+           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
++          .noNativeAtomic64MinMax = bool(shader_flags & SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX),
+       },
+       builder, nulldbg
+   );
+diff --git a/src/airconv/dxbc_converter_ts.cpp b/src/airconv/dxbc_converter_ts.cpp
+index d97bac0..e5767ba 100644
+--- a/src/airconv/dxbc_converter_ts.cpp
++++ b/src/airconv/dxbc_converter_ts.cpp
+@@ -326,6 +326,7 @@ convert_dxbc_vertex_hull_shader(
+       {
+           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
+           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
++          .noNativeAtomic64MinMax = bool(shader_flags & SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX),
+       },
+       builder, nulldbg
+   );
+@@ -868,6 +869,7 @@ convert_dxbc_tesselator_domain_shader(
+       {
+           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
+           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
++          .noNativeAtomic64MinMax = bool(shader_flags & SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX),
+       },
+       builder, nulldbg
+   );
+diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
+index 99bdd64..950ba94 100644
+--- a/src/airconv/dxil_converter.cpp
++++ b/src/airconv/dxil_converter.cpp
+@@ -864,7 +864,7 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
+       case kOpAtomicCmpXchg:
+         if (auto err = record_usage(true, true, false, false))
+           return err;
+-        shader_info.use_atomic64_locks |= DxilAtomic64NeedsLock(*ci);
++        shader_info.use_atomic64_locks |= ci->getType()->isIntegerTy(64);
+         break;
+       case kOpSample:
+       case kOpSampleBias:
+diff --git a/src/airconv/nt/air_builder.hpp b/src/airconv/nt/air_builder.hpp
+index 170ff2a..3fa6b77 100644
+--- a/src/airconv/nt/air_builder.hpp
++++ b/src/airconv/nt/air_builder.hpp
+@@ -109,6 +109,7 @@ class AIRBuilderOptions {
+ public:
+   bool sampleNaNToZero = false;
+   bool defuseFma = false;
++  bool noNativeAtomic64MinMax = false;
+ };
+ 
+ class AIRBuilder {
+@@ -577,6 +578,11 @@ public:
+ 
+   std::string getTypeOverloadSuffix(Type *Ty, Signedness Sign = Signedness::DontCare);
+ 
++  const AIRBuilderOptions &
++  getOptions() const {
++    return options;
++  }
++
+ protected:
+   raw_ostream &debug;
+   AIRBuilderOptions options;
+diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
+index c5a88b4..ba07587 100644
+--- a/src/airconv/nt/dxil_converter_base.cpp
++++ b/src/airconv/nt/dxil_converter_base.cpp
+@@ -2414,7 +2414,7 @@ Converter::EmitAtomicCmpXchg(const CallInst &Call) {
+ }
+ 
+ bool
+-Atomic64NeedsLock(AtomicRMWInst::BinOp Op, bool CompareExchange, bool ResultUsed, bool Threadgroup) {
++Atomic64NeedsLock(AtomicRMWInst::BinOp Op, bool CompareExchange, bool ResultUsed, bool Threadgroup, bool NativeMinMax) {
+   if (CompareExchange)
+     return true;
+   switch (Op) {
+@@ -2425,14 +2425,14 @@ Atomic64NeedsLock(AtomicRMWInst::BinOp Op, bool CompareExchange, bool ResultUsed
+     return false;
+   case AtomicRMWInst::UMin:
+   case AtomicRMWInst::UMax:
+-    return Threadgroup || ResultUsed;
++    return Threadgroup || ResultUsed || !NativeMinMax;
+   default:
+     return true;
+   }
+ }
+ 
+ bool
+-DxilAtomic64NeedsLock(const CallInst &Call) {
++DxilAtomic64NeedsLock(const CallInst &Call, bool NativeMinMax) {
+   if (!Call.getType()->isIntegerTy(64))
+     return false;
+   auto Opcode = asU32(Call.getArgOperand(0));
+@@ -2442,14 +2442,13 @@ DxilAtomic64NeedsLock(const CallInst &Call) {
+     return false;
+   switch (asU32(Call.getArgOperand(2)).value_or(~0u)) {
+   case kAtomicOpAdd:
+-    return Atomic64NeedsLock(AtomicRMWInst::Add, false, false, false);
+   case kAtomicOpAnd:
+   case kAtomicOpOr:
+   case kAtomicOpXor:
+     return false;
+   case kAtomicOpUMin:
+   case kAtomicOpUMax:
+-    return !Call.use_empty();
++    return !NativeMinMax || !Call.use_empty();
+   default:
+     return true;
+   }
+@@ -2495,9 +2494,12 @@ Converter::InitializeLocalAtomic64Locks() {
+     for (auto &Inst : BB) {
+       if (auto *RMW = dyn_cast<AtomicRMWInst>(&Inst))
+         local_atomic64_locked_ |= RMW->getValOperand()->getType()->isIntegerTy(64) &&
+-                                  Atomic64NeedsLock(RMW->getOperation(), false, !RMW->use_empty(), true);
++                                  Atomic64NeedsLock(RMW->getOperation(), false, !RMW->use_empty(), true, false);
+       if (auto *CmpXchg = dyn_cast<AtomicCmpXchgInst>(&Inst))
+         local_atomic64_locked_ |= CmpXchg->getNewValOperand()->getType()->isIntegerTy(64);
++      if (auto *Call = dyn_cast<CallInst>(&Inst))
++        if (Call->getCalledFunction() && Call->getCalledFunction()->getName().startswith("dx.op."))
++          device_atomic64_locked_ |= DxilAtomic64NeedsLock(*Call, !air.getOptions().noNativeAtomic64MinMax);
+     }
+   if (!local_atomic64_locked_)
+     return;
+@@ -2527,9 +2529,9 @@ Converter::EmitAtomic64(AtomicRMWInst::BinOp Op, Value *Ptr, Value *Val, Value *
+ 
+   // A shader takes the lock for all of its 64-bit atomics in one address space once any of them needs it, so that
+   // they stay atomic with respect to each other.
+-  auto *DeviceLocks = Local ? nullptr : ctx.binding.GetAtomic64LockTable(air);
+-  bool Locked = Local ? local_atomic64_locked_ : DeviceLocks != nullptr;
+-  if (Atomic64NeedsLock(Op, Compare != nullptr, ResultUsed, Local) && !Locked)
++  bool Locked = Local ? local_atomic64_locked_ : device_atomic64_locked_;
++  auto *DeviceLocks = Local || !Locked ? nullptr : ctx.binding.GetAtomic64LockTable(air);
++  if (Locked && !Local && !DeviceLocks)
+     return unsupported("dxil: 64-bit atomic without a lock table");
+ 
+   if (!Locked) {
+diff --git a/src/airconv/nt/dxil_converter_base.hpp b/src/airconv/nt/dxil_converter_base.hpp
+index 798009f..368e894 100644
+--- a/src/airconv/nt/dxil_converter_base.hpp
++++ b/src/airconv/nt/dxil_converter_base.hpp
+@@ -119,6 +119,7 @@ private:
+ 
+   // 64-bit atomics (SM 6.6), see EmitAtomic64.
+   bool local_atomic64_locked_ = false;
++  bool device_atomic64_locked_ = false;
+   llvm::GlobalVariable *local_atomic64_locks_ = nullptr;
+   void InitializeLocalAtomic64Locks();
+   llvm::Expected<llvm::Value *> EmitAtomic64(
+@@ -129,8 +130,11 @@ private:
+ 
+ // Metal has 64-bit atomics only as unsigned min/max without a result, on device memory. Add/and/or/xor are split
+ // into two 32-bit atomics; everything else takes a lock word. True when this operation needs the lock.
+-bool Atomic64NeedsLock(llvm::AtomicRMWInst::BinOp Op, bool CompareExchange, bool ResultUsed, bool Threadgroup);
+-// The same decision for a dx.op.atomicBinOp / dx.op.atomicCompareExchange call.
+-bool DxilAtomic64NeedsLock(const llvm::CallInst &Call);
++bool Atomic64NeedsLock(
++    llvm::AtomicRMWInst::BinOp Op, bool CompareExchange, bool ResultUsed, bool Threadgroup, bool NativeMinMax
++);
++// The same decision for a dx.op.atomicBinOp / dx.op.atomicCompareExchange call; NativeMinMax: the GPU has Metal's
++// 64-bit min/max.
++bool DxilAtomic64NeedsLock(const llvm::CallInst &Call, bool NativeMinMax);
+ 
+ } // namespace dxmt::dxil
+diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
+index b130151..c9f3f2a 100644
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -406,7 +406,8 @@ public:
+       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS11))
+         return E_INVALIDARG;
+       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11 *>(pFeatureData);
+-      out->AtomicInt64OnDescriptorHeapResourceSupported = FALSE;
++      // Heap buffers reach the same lock table as other buffers.
++      out->AtomicInt64OnDescriptorHeapResourceSupported = TRUE;
+       return S_OK;
+     }
+     case D3D12_FEATURE_SHADER_CACHE: {
+diff --git a/src/d3d12/d3d12_pipeline_compute.cpp b/src/d3d12/d3d12_pipeline_compute.cpp
+index 5d6bb17..4b4ed9f 100644
+--- a/src/d3d12/d3d12_pipeline_compute.cpp
++++ b/src/d3d12/d3d12_pipeline_compute.cpp
+@@ -51,7 +51,10 @@ public:
+     rootsig.next = nullptr;
+ 
+     SM50_SHADER_COMMON_DATA common;
+-    common.flags = {};
++    // Metal's 64-bit atomic min/max needs Apple8 (M2) or later; airconv takes a lock otherwise.
++    common.flags = device_->GetMTLDevice().supportsFamily(WMTGPUFamilyApple8)
++                       ? SM50_SHADER_FLAG{}
++                       : SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX;
+     common.type = SM50_SHADER_COMMON;
+     common.metal_version = SM50_SHADER_METAL_310;
+     common.next = &rootsig;
+diff --git a/src/d3d12/d3d12_pipeline_graphics.cpp b/src/d3d12/d3d12_pipeline_graphics.cpp
+index 920f523..54da527 100644
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -487,7 +487,10 @@ public:
+     WMT::Reference<WMT::Function> vs_func, ps_func;
+ 
+     SM50_SHADER_COMMON_DATA common;
+-    common.flags = {};
++    // Metal's 64-bit atomic min/max needs Apple8 (M2) or later; airconv takes a lock otherwise.
++    common.flags = device_->GetMTLDevice().supportsFamily(WMTGPUFamilyApple8)
++                       ? SM50_SHADER_FLAG{}
++                       : SM50_SHADER_FLAG_NO_NATIVE_ATOMIC64_MINMAX;
+     common.type = SM50_SHADER_COMMON;
+     common.metal_version = SM50_SHADER_METAL_310;
+     common.next = nullptr;
+-- 
+2.50.1 (Apple Git-155)
+

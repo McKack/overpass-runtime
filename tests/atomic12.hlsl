@@ -1,13 +1,21 @@
 // tests/atomic12.cpp: 64-bit atomics (SM 6.6) on a raw buffer and on groupshared memory, 16 groups of 64 threads.
 // Built twice: with -DSPLIT only the operations that need no lock (add/or/xor, unsigned max without a result),
-// without it everything, so all 64-bit atomics in the shader go through the lock words.
+// without it everything, so all 64-bit atomics in the shader go through the lock words. With -DHEAP as well, the
+// buffer is reached through ResourceDescriptorHeap[0] instead of a root UAV.
+#ifdef HEAP
+#define RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED)"
+#else
 #define RS "UAV(u0)"
 RWByteAddressBuffer b : register(u0);
+#endif
 groupshared uint64_t g_add, g_xor, g_cas;
 groupshared int64_t g_max;
 
 [RootSignature(RS)] [numthreads(64, 1, 1)]
 void main(uint i : SV_DispatchThreadID, uint l : SV_GroupIndex, uint grp : SV_GroupID) {
+#ifdef HEAP
+  RWByteAddressBuffer b = ResourceDescriptorHeap[0];
+#endif
   if (l == 0) { g_add = 0; g_xor = 0; g_cas = 0; g_max = -1000; }
   GroupMemoryBarrierWithGroupSync();
   b.InterlockedAdd64(0, 0x100000001ull);               // slot 0: 1024 * 0x100000001
