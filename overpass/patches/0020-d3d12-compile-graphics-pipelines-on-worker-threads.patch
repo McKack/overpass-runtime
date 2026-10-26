@@ -1,0 +1,234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 00:31:53 +0100
+Subject: [PATCH] d3d12: compile graphics pipelines on worker threads
+
+CreateGraphicsPipelineState copies the description and compiles on DXMT's task scheduler; the first draw with the pipeline waits for it. d3d12.asyncPipelineCompile (default on) and d3d12.skipDrawsWhileCompiling (default off: drop draws until the pipeline is ready).
+---
+ src/d3d12/d3d12_command_list.cpp      |  18 ++++-
+ src/d3d12/d3d12_device.hpp            |   4 +
+ src/d3d12/d3d12_pipeline_graphics.cpp | 111 ++++++++++++++++++++++++++
+ 3 files changed, 129 insertions(+), 4 deletions(-)
+
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index 37aff79..85fd8a0 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -20,6 +20,7 @@
+ #include "d3d12_interfaces.hpp"
+ #include "com/com_pointer.hpp"
+ #include "dxmt_format.hpp"
++#include "config/config.hpp"
+ #include <optional>
+ #include <vector>
+ 
+@@ -626,8 +627,20 @@ public:
+     return {offset, stride};
+   }
+ 
++  // A pipeline still compiling on a worker thread: wait for it, or with d3d12.skipDrawsWhileCompiling drop the
++  // draw (the object is missing for a frame or so instead of the game stalling). Draws with a pipeline that
++  // failed to compile are dropped.
++  bool
++  GraphicsPipelineReady() {
++    static const bool skip = Config::getInstance().getOption<bool>("d3d12.skipDrawsWhileCompiling", false);
++    return pso_graphics_ && pso_graphics_->Ready(!skip);
++  }
++
+   DrawCallStatus
+   PreDraw(bool SkipResourceBinding = false) {
++    if (!GraphicsPipelineReady())
++      return DrawCallStatus::Invalid;
++
+     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Render) {
+ 
+       allocator_->InvalidateCurrentPass();
+@@ -704,9 +717,6 @@ public:
+       visibility_dirty_ = !running_occlusion_queries_.empty();
+     }
+ 
+-    if (!pso_graphics_)
+-      return DrawCallStatus::Invalid;
+-
+     if (visibility_dirty_)
+       EncodeVisibilityResultMode();
+ 
+@@ -997,7 +1007,7 @@ public:
+   // The object (amplification) and mesh stages get the same root argument / static sampler buffers.
+   void STDMETHODCALLTYPE
+   DispatchMesh(UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ) {
+-    if (!pso_graphics_ || !pso_graphics_->mesh_pipeline)
++    if (!GraphicsPipelineReady() || !pso_graphics_->mesh_pipeline)
+       return;
+     if (!ThreadGroupCountX || !ThreadGroupCountY || !ThreadGroupCountZ)
+       return;
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index fded268..24b0d3e 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -168,6 +168,10 @@ public:
+   bool is_tessellation = false;
+   uint32_t tess_threads_per_patch = 0;
+ 
++  // Whether the pipeline can be drawn with. One compiled on a worker thread isn't until it's done (Wait blocks
++  // until then); one that failed to compile there never is.
++  virtual bool Ready(bool Wait) = 0;
++
+   virtual WMT::DepthStencilState GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) = 0;
+ 
+   virtual WMT::RenderPipelineState
+diff --git a/src/d3d12/d3d12_pipeline_graphics.cpp b/src/d3d12/d3d12_pipeline_graphics.cpp
+index 227f9c0..0accb0d 100644
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -21,9 +21,14 @@
+ #include "d3d12_pipeline.hpp"
+ #include "d3d12_shader_cache.hpp"
+ #include "dxmt_format.hpp"
++#include "dxmt_tasks.hpp"
+ #include "com/com_object.hpp"
+ #include "com/com_pointer.hpp"
++#include "config/config.hpp"
+ #include "sha1/sha1_util.hpp"
++#include <atomic>
++#include <string>
++#include <vector>
+ #include "DXBCParser/BlobContainer.h"
+ #include "DXBCParser/DXBCUtils.h"
+ 
+@@ -265,12 +270,33 @@ protected:
+ 
+   WMT::Reference<WMT::RenderPipelineState> pso;
+ 
++  enum class CompileState { Compiling, Ready, Failed };
++  std::atomic<CompileState> compile_state_ = CompileState::Ready;
++
+ public:
+   MTLD3D12GraphicsPipelineStateImpl(MTLD3D12Device *pDevice) :
+       MTLD3D12Pageable<MTLD3D12GraphicsPipelineState>(pDevice) {
+     IsComputePipelineState = FALSE;
+   }
+ 
++  bool
++  Ready(bool Wait) final {
++    if (Wait)
++      compile_state_.wait(CompileState::Compiling, std::memory_order_acquire);
++    return compile_state_.load(std::memory_order_acquire) == CompileState::Ready;
++  }
++
++  void
++  BeginCompile() {
++    compile_state_.store(CompileState::Compiling, std::memory_order_relaxed);
++  }
++
++  void
++  EndCompile(HRESULT hr) {
++    compile_state_.store(SUCCEEDED(hr) ? CompileState::Ready : CompileState::Failed, std::memory_order_release);
++    compile_state_.notify_all();
++  }
++
+   bool
+   BlendFactorIsDualSource(D3D12_BLEND Blend) {
+     return (Blend >= D3D12_BLEND_SRC1_COLOR) && (Blend <= D3D12_BLEND_INV_SRC1_ALPHA);
+@@ -1242,6 +1268,79 @@ public:
+   }
+ };
+ 
++// A pipeline compiled on a worker thread, with its own copy of everything the description points to (the game
++// may free that once CreateGraphicsPipelineState returns) and a reference that keeps the pipeline alive until
++// it's done.
++struct GraphicsPipelineCompileWork {
++  Com<MTLD3D12GraphicsPipelineStateImpl, false> pso;
++  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
++  D3D12_SHADER_BYTECODE as{}, ms{};
++  Com<ID3D12RootSignature> root_signature;
++  std::vector<std::vector<char>> bytecode;
++  std::vector<D3D12_INPUT_ELEMENT_DESC> input_elements;
++  std::vector<std::string> semantic_names;
++
++  GraphicsPipelineCompileWork(
++      MTLD3D12GraphicsPipelineStateImpl *pPSO, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc,
++      const D3D12_SHADER_BYTECODE *pAS, const D3D12_SHADER_BYTECODE *pMS
++  ) :
++      pso(pPSO),
++      desc(*pDesc),
++      root_signature(pDesc->pRootSignature) {
++    desc.CachedPSO = {};
++    bytecode.reserve(7);
++    auto copy = [&](D3D12_SHADER_BYTECODE &Shader) {
++      if (!Shader.pShaderBytecode)
++        return;
++      auto data = static_cast<const char *>(Shader.pShaderBytecode);
++      Shader.pShaderBytecode = bytecode.emplace_back(data, data + Shader.BytecodeLength).data();
++    };
++    copy(desc.VS);
++    copy(desc.PS);
++    copy(desc.GS);
++    copy(desc.HS);
++    copy(desc.DS);
++    if (pMS && pMS->pShaderBytecode) {
++      as = pAS ? *pAS : D3D12_SHADER_BYTECODE{};
++      ms = *pMS;
++      copy(as);
++      copy(ms);
++    }
++    input_elements.assign(
++        pDesc->InputLayout.pInputElementDescs, pDesc->InputLayout.pInputElementDescs + pDesc->InputLayout.NumElements
++    );
++    semantic_names.reserve(input_elements.size());
++    for (auto &element : input_elements)
++      element.SemanticName = semantic_names.emplace_back(element.SemanticName).c_str();
++    desc.InputLayout.pInputElementDescs = input_elements.data();
++  }
++
++  void
++  Run() {
++    HRESULT hr = ms.pShaderBytecode ? pso->InitializeMesh(&desc, as, ms) : pso->Initialize(&desc);
++    if (FAILED(hr))
++      ERR("CreatePipelineState: pipeline failed to compile on a worker thread; its draws are dropped");
++    pso->EndCompile(hr);
++  }
++};
++
++template <> struct task_trait<GraphicsPipelineCompileWork *> {
++  GraphicsPipelineCompileWork *
++  run_task(GraphicsPipelineCompileWork *task) {
++    task->Run();
++    return task;
++  }
++  bool
++  get_done(GraphicsPipelineCompileWork *task) {
++    return false;
++  }
++  // The scheduler's last use of a finished task (pipelines have no dependencies).
++  void
++  set_done(GraphicsPipelineCompileWork *task) {
++    delete task;
++  }
++};
++
+ HRESULT
+ CreateGraphicsPipelineState(
+     MTLD3D12Device *pDevice, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState,
+@@ -1255,6 +1354,18 @@ CreateGraphicsPipelineState(
+     pso = Com<MTLD3D12GraphicsPipelineStateImpl>(new MTLD3D12GeometryGraphicsPipelineStateImpl(pDevice));
+   else
+     pso = Com(new MTLD3D12GraphicsPipelineStateImpl(pDevice));
++
++  // Compiling on worker threads lets the game go on while pipelines compile, several at a time; the first draw
++  // with a pipeline waits for it. What can fail without compiling still fails here.
++  static const bool async = Config::getInstance().getOption<bool>("d3d12.asyncPipelineCompile", true);
++  if (async && !pDesc->StreamOutput.NumEntries && (pDesc->VS.pShaderBytecode || (pMS && pMS->pShaderBytecode))) {
++    // Never destroyed: its workers would be joined while the DLL unloads.
++    static auto *scheduler = new task_scheduler<GraphicsPipelineCompileWork *>();
++    pso->BeginCompile();
++    scheduler->submit(new GraphicsPipelineCompileWork(pso.ptr(), pDesc, pAS, pMS));
++    return pso->QueryInterface(riid, ppPipelineState);
++  }
++
+   HRESULT hr = pMS && pMS->pShaderBytecode ? pso->InitializeMesh(pDesc, pAS ? *pAS : D3D12_SHADER_BYTECODE{}, *pMS)
+                                            : pso->Initialize(pDesc);
+   if (FAILED(hr))
+-- 
+2.50.1 (Apple Git-155)
+
