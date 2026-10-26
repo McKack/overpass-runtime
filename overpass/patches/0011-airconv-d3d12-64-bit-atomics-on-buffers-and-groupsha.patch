@@ -1,0 +1,630 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 01:18:29 +0100
+Subject: [PATCH] airconv, d3d12: 64-bit atomics on buffers and groupshared
+ memory
+
+Metal has 64-bit atomics only as unsigned min/max without a result, on device
+memory; those map to it directly. Add, and, or and xor are split into two
+32-bit atomics (add carries into the high half). Everything else (exchange,
+compare-exchange, signed min/max, results of min/max) takes a lock word: a
+4096-word table per D3D12 device, passed as one more root argument qword after
+the parameters (and the heap addresses), or 32 threadgroup words for
+groupshared memory, zeroed before the shader body. Once a shader needs the lock
+in an address space, all its 64-bit atomics there use it. Every lane of a SIMD
+group stays in the lock loop until all are done (simd_any), so the lane that
+holds the lock always reaches its release.
+
+Also: groupshared cmpxchg instructions (32-bit too), D3D12 OPTIONS9/OPTIONS11,
+and airconv -rootsig to convert with the shader's embedded root signature.
+---
+ src/airconv/airconv_cli.cpp            |  14 ++
+ src/airconv/dxbc_binding_rootsig.cpp   |  15 ++
+ src/airconv/dxbc_converter.hpp         |   1 +
+ src/airconv/dxil_converter.cpp         |   1 +
+ src/airconv/nt/dxbc_binding_map.hpp    |   5 +
+ src/airconv/nt/dxil_converter_base.cpp | 267 +++++++++++++++++++++++++
+ src/airconv/nt/dxil_converter_base.hpp |  15 ++
+ src/d3d12/d3d12_command_list.cpp       |  13 +-
+ src/d3d12/d3d12_device.cpp             |  41 ++++
+ src/d3d12/d3d12_device.hpp             |   5 +
+ src/d3d12/d3d12_root_signature.cpp     |   1 +
+ 11 files changed, 376 insertions(+), 2 deletions(-)
+
+diff --git a/src/airconv/airconv_cli.cpp b/src/airconv/airconv_cli.cpp
+index e9e6573..7f08bb5 100644
+--- a/src/airconv/airconv_cli.cpp
++++ b/src/airconv/airconv_cli.cpp
+@@ -52,6 +52,10 @@ static cl::opt<bool>
+ static cl::opt<bool>
+   EmitMetallib("A", cl::init(false), cl::desc("Write output as .metallib"));
+ 
++static cl::opt<bool> UseRootSignature(
++  "rootsig", cl::init(false), cl::desc("Bind resources through the root signature embedded in the input (D3D12)")
++);
++
+ static cl::opt<bool> DisassembleDXBC(
+   "disas-dxbc", cl::init(false), cl::desc("Disassemble dxbc shader")
+ );
+@@ -221,6 +225,16 @@ int main(int argc, char **argv) {
+   data.next = 0;
+   data.type = SM50_SHADER_COMMON;
+ 
++  SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
++  rootsig.type = SM50_SHADER_ROOT_SIGNATURE;
++  rootsig.bytecode = MemRef.getBufferStart();
++  rootsig.bytecode_length = MemRef.getBufferSize();
++  rootsig.next = nullptr;
++  if (UseRootSignature) {
++    data.metal_version = SM50_SHADER_METAL_310; // as d3d12 compiles pipelines
++    data.next = &rootsig;
++  }
++
+   if (!HullBeforeDomain.getValue().empty()) {
+     ErrorOr<std::unique_ptr<MemoryBuffer>> FileOrErr =
+       MemoryBuffer::getFile(HullBeforeDomain, /*IsText=*/false);
+diff --git a/src/airconv/dxbc_binding_rootsig.cpp b/src/airconv/dxbc_binding_rootsig.cpp
+index b506c3d..5d4c6b7 100644
+--- a/src/airconv/dxbc_binding_rootsig.cpp
++++ b/src/airconv/dxbc_binding_rootsig.cpp
+@@ -327,8 +327,16 @@ public:
+     return CounterDescriptor{Pointer};
+   }
+ 
++  virtual llvm::Value *
++  GetAtomic64LockTable(llvm::air::AIRBuilder &Builder) {
++    if (~RootSignatureArgumentIndex == 0 || ~Atomic64LockArgIndex == 0)
++      return nullptr;
++    return GetArgument(Builder, RootSignatureArgumentIndex, Atomic64LockArgIndex);
++  }
++
+   uint32_t RootSignatureArgumentIndex = ~0u;
+   uint32_t StaticSamplerArgumentIndex = ~0u;
++  uint32_t Atomic64LockArgIndex = ~0u;
+ 
+   std::map<RangeId, std::pair<ConstantBufferInfo, uint64_t>> ConstantBuffers;
+   std::map<RangeId, std::pair<SamplerInfo, uint64_t>> Samplers;
+@@ -595,6 +603,13 @@ setup_binding_rootsig(
+       }
+   }
+ 
++  // Every root signature ends with the device's lock table for 64-bit atomics (after the heap addresses, if any).
++  if (shader_info->use_atomic64_locks) {
++    binding_map->Atomic64LockArgIndex = builder.DefineBuffer(
++        "atomic64_locks", AddressSpace::device, MemoryAccess::read_write, msl_uint, inc_attribute_index++
++    );
++  }
++
+   auto [type, metadata] = builder.Build(module.getContext(), module.getDataLayout());
+ 
+   binding_map->RootSignatureArgumentIndex = func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
+diff --git a/src/airconv/dxbc_converter.hpp b/src/airconv/dxbc_converter.hpp
+index fc1fa36..bb13a66 100644
+--- a/src/airconv/dxbc_converter.hpp
++++ b/src/airconv/dxbc_converter.hpp
+@@ -105,6 +105,7 @@ public:
+   bool output_control_point_read = false;
+   bool use_msad = false;
+   bool use_samplepos = false;
++  bool use_atomic64_locks = false; // 64-bit device atomics that need the lock table
+   std::vector<PhaseInfo> phases;
+   uint32_t pull_mode_reg_mask = 0;
+ };
+diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
+index 61da07f..99bdd64 100644
+--- a/src/airconv/dxil_converter.cpp
++++ b/src/airconv/dxil_converter.cpp
+@@ -864,6 +864,7 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
+       case kOpAtomicCmpXchg:
+         if (auto err = record_usage(true, true, false, false))
+           return err;
++        shader_info.use_atomic64_locks |= DxilAtomic64NeedsLock(*ci);
+         break;
+       case kOpSample:
+       case kOpSampleBias:
+diff --git a/src/airconv/nt/dxbc_binding_map.hpp b/src/airconv/nt/dxbc_binding_map.hpp
+index c92b050..56d13f4 100644
+--- a/src/airconv/nt/dxbc_binding_map.hpp
++++ b/src/airconv/nt/dxbc_binding_map.hpp
+@@ -57,6 +57,11 @@ public:
+   GetUAVBuffer(llvm::air::AIRBuilder &Builder, RangeId Range, llvm::Value *Index) = 0;
+   virtual llvm::Optional<CounterDescriptor>
+   GetUAVCounter(llvm::air::AIRBuilder &Builder, RangeId Range, llvm::Value *Index) = 0;
++  // Device-wide lock words (uint, device address space) for the 64-bit atomics Metal lacks; null when not bound.
++  virtual llvm::Value *
++  GetAtomic64LockTable(llvm::air::AIRBuilder &Builder) {
++    return nullptr;
++  }
+ };
+ 
+ } // namespace dxmt::dxbc
+\ No newline at end of file
+diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
+index 973a89b..c5a88b4 100644
+--- a/src/airconv/nt/dxil_converter_base.cpp
++++ b/src/airconv/nt/dxil_converter_base.cpp
+@@ -66,6 +66,8 @@ Converter::Run(llvm::BasicBlock *ReturnBB) {
+       }
+     }
+ 
++    InitializeLocalAtomic64Locks();
++
+     // FIXME: remove const_cast
+     for (auto &BB : *const_cast<llvm::Function *>(entry.function)) {
+       ir.SetInsertPoint(block_map_[&BB]);
+@@ -585,11 +587,43 @@ Converter::TranslateInstruction(llvm::Instruction *Inst) {
+     auto Value = operand(1);
+     if (!Value)
+       return Value.takeError();
++    if ((*Value)->getType()->isIntegerTy(64))
++      return EmitAtomic64(OldAtomic->getOperation(), *Ptr, *Value, nullptr, !OldAtomic->use_empty());
+     return ir.CreateAtomicRMW(
+         OldAtomic->getOperation(), *Ptr, *Value, OldAtomic->getAlign(), OldAtomic->getOrdering(),
+         OldAtomic->getSyncScopeID()
+     );
+   }
++  case llvm::Instruction::AtomicCmpXchg: {
++    // groupshared InterlockedCompareExchange: { old value, success }
++    auto *OldCmpXchg = llvm::cast<llvm::AtomicCmpXchgInst>(Inst);
++    auto Ptr = operand(0);
++    if (!Ptr)
++      return Ptr.takeError();
++    auto Compare = operand(1);
++    if (!Compare)
++      return Compare.takeError();
++    auto NewValue = operand(2);
++    if (!NewValue)
++      return NewValue.takeError();
++    llvm::Value *Old;
++    if ((*NewValue)->getType()->isIntegerTy(64)) {
++      auto Result = EmitAtomic64(AtomicRMWInst::Xchg, *Ptr, *NewValue, *Compare, true);
++      if (!Result)
++        return Result.takeError();
++      Old = *Result;
++    } else {
++      Old = ir.CreateExtractValue(
++          ir.CreateAtomicCmpXchg(
++              *Ptr, *Compare, *NewValue, OldCmpXchg->getAlign(), AtomicOrdering::Monotonic, AtomicOrdering::Monotonic
++          ),
++          0
++      );
++    }
++    llvm::Value *Pair = llvm::UndefValue::get(MapType(OldCmpXchg->getType()));
++    Pair = ir.CreateInsertValue(Pair, Old, 0);
++    return ir.CreateInsertValue(Pair, ir.CreateICmpEQ(Old, *Compare), 1);
++  }
+   default:
+     return unsupported(std::string("dxil: unsupported instruction: ") + Inst->getOpcodeName());
+   }
+@@ -2275,6 +2309,10 @@ Converter::EmitAtomicRMW(const CallInst &Call) {
+     }
+     auto Index = ir.CreateLShr(ByteOffset, ir.getInt32(2));
+     auto *Ptr = ir.CreateGEP(ir.getInt32Ty(), Buffer->Pointer, {Index});
++    if ((*NewValue)->getType()->isIntegerTy(64))
++      return EmitAtomic64(
++          BinOp, ir.CreateBitCast(Ptr, ir.getInt64Ty()->getPointerTo(1)), *NewValue, nullptr, !Call.use_empty()
++      );
+     auto Value = air.CreateAtomicRMW(BinOp, Ptr, *NewValue);
+     if (!Value)
+       return unsupported("dxil: atomic operation failed");
+@@ -2336,6 +2374,10 @@ Converter::EmitAtomicCmpXchg(const CallInst &Call) {
+     }
+     auto Index = ir.CreateLShr(ByteOffset, ir.getInt32(2));
+     auto *Ptr = ir.CreateGEP(ir.getInt32Ty(), Buffer->Pointer, {Index});
++    if ((*NewValue)->getType()->isIntegerTy(64))
++      return EmitAtomic64(
++          AtomicRMWInst::Xchg, ir.CreateBitCast(Ptr, ir.getInt64Ty()->getPointerTo(1)), *NewValue, *Compare, true
++      );
+     auto Result = ir.CreateAtomicCmpXchg(
+         Ptr, *Compare, *NewValue, MaybeAlign(), AtomicOrdering::Monotonic, AtomicOrdering::Monotonic
+     );
+@@ -2371,6 +2413,231 @@ Converter::EmitAtomicCmpXchg(const CallInst &Call) {
+   return ir.CreateExtractElement(Result, 0ull);
+ }
+ 
++bool
++Atomic64NeedsLock(AtomicRMWInst::BinOp Op, bool CompareExchange, bool ResultUsed, bool Threadgroup) {
++  if (CompareExchange)
++    return true;
++  switch (Op) {
++  case AtomicRMWInst::Add:
++  case AtomicRMWInst::And:
++  case AtomicRMWInst::Or:
++  case AtomicRMWInst::Xor:
++    return false;
++  case AtomicRMWInst::UMin:
++  case AtomicRMWInst::UMax:
++    return Threadgroup || ResultUsed;
++  default:
++    return true;
++  }
++}
++
++bool
++DxilAtomic64NeedsLock(const CallInst &Call) {
++  if (!Call.getType()->isIntegerTy(64))
++    return false;
++  auto Opcode = asU32(Call.getArgOperand(0));
++  if (Opcode == kOpAtomicCmpXchg)
++    return true;
++  if (Opcode != kOpAtomicBinOp)
++    return false;
++  switch (asU32(Call.getArgOperand(2)).value_or(~0u)) {
++  case kAtomicOpAdd:
++    return Atomic64NeedsLock(AtomicRMWInst::Add, false, false, false);
++  case kAtomicOpAnd:
++  case kAtomicOpOr:
++  case kAtomicOpXor:
++    return false;
++  case kAtomicOpUMin:
++  case kAtomicOpUMax:
++    return !Call.use_empty();
++  default:
++    return true;
++  }
++}
++
++// One 32-bit AIR atomic on device (address space 1) or threadgroup (3) memory, relaxed. Op is load, store,
++// cmpxchg.weak or a read-modify-write name; Args go between the pointer and the order/scope operands.
++llvm::Value *
++Converter::AtomicCall32(StringRef Op, Value *Ptr, ArrayRef<Value *> Args, bool Void) {
++  bool Local = Ptr->getType()->getPointerAddressSpace() == 3;
++  bool Exchange = Op == "cmpxchg.weak";
++  std::string Name = std::string("air.atomic.") + (Local ? "local." : "global.") + Op.str();
++  bool Typed = Op != "load" && Op != "store" && !Exchange && Op != "xchg";
++  Name += Typed ? ".u.i32" : ".i32";
++  SmallVector<Type *> Tys{Ptr->getType()};
++  SmallVector<Value *> Ops{Ptr};
++  for (auto *Arg : Args) {
++    Tys.push_back(Arg->getType());
++    Ops.push_back(Arg);
++  }
++  // memory order(s) relaxed, then the scope and volatile
++  Tys.push_back(ir.getInt32Ty());
++  Ops.push_back(ir.getInt32(0));
++  if (Exchange) {
++    Tys.push_back(ir.getInt32Ty());
++    Ops.push_back(ir.getInt32(0));
++  }
++  Tys.push_back(ir.getInt32Ty());
++  Ops.push_back(ir.getInt32(Local ? 1 : 2));
++  Tys.push_back(ir.getInt1Ty());
++  Ops.push_back(ir.getTrue());
++  auto *Fn = air.getModule()
++                 ->getOrInsertFunction(Name, FunctionType::get(Void ? ir.getVoidTy() : ir.getInt32Ty(), Tys, false))
++                 .getCallee();
++  return ir.CreateCall(cast<Function>(Fn)->getFunctionType(), Fn, Ops);
++}
++
++// Threadgroup lock words exist when a groupshared 64-bit atomic needs one; every thread zeroes them before the
++// shader body starts.
++void
++Converter::InitializeLocalAtomic64Locks() {
++  for (auto &BB : *entry.function)
++    for (auto &Inst : BB) {
++      if (auto *RMW = dyn_cast<AtomicRMWInst>(&Inst))
++        local_atomic64_locked_ |= RMW->getValOperand()->getType()->isIntegerTy(64) &&
++                                  Atomic64NeedsLock(RMW->getOperation(), false, !RMW->use_empty(), true);
++      if (auto *CmpXchg = dyn_cast<AtomicCmpXchgInst>(&Inst))
++        local_atomic64_locked_ |= CmpXchg->getNewValOperand()->getType()->isIntegerTy(64);
++    }
++  if (!local_atomic64_locked_)
++    return;
++  auto *Ty = ArrayType::get(ir.getInt32Ty(), 32);
++  local_atomic64_locks_ = new GlobalVariable(
++      *air.getModule(), Ty, false, GlobalValue::InternalLinkage, UndefValue::get(Ty), "atomic64_locks", nullptr,
++      GlobalValue::NotThreadLocal, 3
++  );
++  local_atomic64_locks_->setAlignment(Align(4));
++  ir.SetInsertPoint(block_map_[&entry.function->getEntryBlock()]);
++  ir.CreateStore(ConstantAggregateZero::get(Ty), local_atomic64_locks_);
++  air.CreateBarrier(MemFlags::Threadgroup);
++}
++
++// Ptr is an i64 pointer to device or threadgroup memory. With Compare it's a compare-exchange (Op ignored).
++// Returns the previous value.
++llvm::Expected<llvm::Value *>
++Converter::EmitAtomic64(AtomicRMWInst::BinOp Op, Value *Ptr, Value *Val, Value *Compare, bool ResultUsed) {
++  bool Local = Ptr->getType()->getPointerAddressSpace() == 3;
++  unsigned AS = Local ? 3 : 1;
++  auto *I32 = ir.getInt32Ty(), *I64 = ir.getInt64Ty();
++  auto *Lo = ir.CreateBitCast(Ptr, I32->getPointerTo(AS));
++  auto *Hi = ir.CreateGEP(I32, Lo, {ir.getInt32(1)});
++  auto Combine = [&](Value *L, Value *H) {
++    return ir.CreateOr(ir.CreateZExt(L, I64), ir.CreateShl(ir.CreateZExt(H, I64), 32));
++  };
++
++  // A shader takes the lock for all of its 64-bit atomics in one address space once any of them needs it, so that
++  // they stay atomic with respect to each other.
++  auto *DeviceLocks = Local ? nullptr : ctx.binding.GetAtomic64LockTable(air);
++  bool Locked = Local ? local_atomic64_locked_ : DeviceLocks != nullptr;
++  if (Atomic64NeedsLock(Op, Compare != nullptr, ResultUsed, Local) && !Locked)
++    return unsupported("dxil: 64-bit atomic without a lock table");
++
++  if (!Locked) {
++    if (Op == AtomicRMWInst::UMin || Op == AtomicRMWInst::UMax) {
++      // native: void air.atomic.global.{min,max}.u.i64
++      std::string Name = std::string("air.atomic.global.") + (Op == AtomicRMWInst::UMin ? "min" : "max") + ".u.i64";
++      auto Fn = air.getModule()->getOrInsertFunction(
++          Name, FunctionType::get(ir.getVoidTy(), {Ptr->getType(), I64, I32, I32, ir.getInt1Ty()}, false)
++      );
++      ir.CreateCall(Fn, {Ptr, Val, ir.getInt32(0), ir.getInt32(2), ir.getTrue()});
++      return UndefValue::get(I64);
++    }
++    auto *ValLo = ir.CreateTrunc(Val, I32);
++    auto *ValHi = ir.CreateTrunc(ir.CreateLShr(Val, 32), I32);
++    StringRef Name = Op == AtomicRMWInst::Add ? "add" : Op == AtomicRMWInst::And ? "and" : Op == AtomicRMWInst::Or ? "or" : "xor";
++    auto *OldLo = AtomicCall32(Name, Lo, {ValLo}, false);
++    if (Op == AtomicRMWInst::Add) {
++      auto *Carry = ir.CreateZExt(ir.CreateICmpULT(ir.CreateAdd(OldLo, ValLo), OldLo), I32);
++      ValHi = ir.CreateAdd(ValHi, Carry);
++    }
++    auto *OldHi = AtomicCall32(Name, Hi, {ValHi}, false);
++    return Combine(OldLo, OldHi);
++  }
++
++  // Spin lock. Every lane of the SIMD group stays in the loop until all of them are done (a convergent simd_any
++  // decides), so a lane holding the lock always gets to release it: with a divergent exit, the compiler may move
++  // the critical section after the loop, where its lane waits for the spinning ones forever.
++  auto *Addr = ir.CreateLShr(ir.CreatePtrToInt(Ptr, I64), 3);
++  Value *Lock;
++  if (Local) {
++    auto *Slot = ir.CreateAnd(ir.CreateTrunc(Addr, I32), 31);
++    Lock = ir.CreateGEP(local_atomic64_locks_->getValueType(), local_atomic64_locks_, {ir.getInt32(0), Slot});
++  } else {
++    auto *Slot = ir.CreateAnd(ir.CreateTrunc(Addr, I32), 4095);
++    Lock = ir.CreateGEP(I32, ir.CreateBitCast(DeviceLocks, I32->getPointerTo(1)), {Slot});
++  }
++  auto *Fn = ir.GetInsertBlock()->getParent();
++  auto *EntryBB = &Fn->getEntryBlock();
++  auto *BeforeBB = ir.GetInsertBlock();
++  auto *LoopBB = BasicBlock::Create(air.getContext(), "atomic64.lock", Fn);
++  auto *TryBB = BasicBlock::Create(air.getContext(), "atomic64.try", Fn);
++  auto *CriticalBB = BasicBlock::Create(air.getContext(), "atomic64.critical", Fn);
++  auto *LatchBB = BasicBlock::Create(air.getContext(), "atomic64.latch", Fn);
++  auto *DoneBB = BasicBlock::Create(air.getContext(), "atomic64.done", Fn);
++
++  IRBuilder<> EntryIR(EntryBB, EntryBB->getFirstInsertionPt());
++  auto *Expected = EntryIR.CreateAlloca(I32);
++  ir.CreateBr(LoopBB);
++
++  ir.SetInsertPoint(LoopBB);
++  auto *WasDone = ir.CreatePHI(ir.getInt1Ty(), 2);
++  auto *WasResult = ir.CreatePHI(I64, 2);
++  WasDone->addIncoming(ir.getFalse(), BeforeBB);
++  WasResult->addIncoming(UndefValue::get(I64), BeforeBB);
++  ir.CreateCondBr(WasDone, LatchBB, TryBB);
++
++  ir.SetInsertPoint(TryBB);
++  ir.CreateStore(ir.getInt32(0), Expected);
++  auto *Previous = AtomicCall32("cmpxchg.weak", Lock, {Expected, ir.getInt32(1)}, false);
++  ir.CreateCondBr(ir.CreateICmpEQ(Previous, ir.getInt32(0)), CriticalBB, LatchBB);
++
++  ir.SetInsertPoint(CriticalBB);
++  auto Flags = Local ? MemFlags::Threadgroup : MemFlags::Device;
++  auto Scope = Local ? ThreadScope::Threadgroup : ThreadScope::Device;
++  air.CreateAtomicFence(Flags, Scope, false);
++  auto *Old = Combine(AtomicCall32("load", Lo, {}, false), AtomicCall32("load", Hi, {}, false));
++  Value *New;
++  if (Compare) {
++    New = ir.CreateSelect(ir.CreateICmpEQ(Old, Compare), Val, Old);
++  } else {
++    switch (Op) {
++    case AtomicRMWInst::Add: New = ir.CreateAdd(Old, Val); break;
++    case AtomicRMWInst::Sub: New = ir.CreateSub(Old, Val); break;
++    case AtomicRMWInst::And: New = ir.CreateAnd(Old, Val); break;
++    case AtomicRMWInst::Or: New = ir.CreateOr(Old, Val); break;
++    case AtomicRMWInst::Xor: New = ir.CreateXor(Old, Val); break;
++    case AtomicRMWInst::Max: New = ir.CreateSelect(ir.CreateICmpSGT(Old, Val), Old, Val); break;
++    case AtomicRMWInst::Min: New = ir.CreateSelect(ir.CreateICmpSLT(Old, Val), Old, Val); break;
++    case AtomicRMWInst::UMax: New = ir.CreateSelect(ir.CreateICmpUGT(Old, Val), Old, Val); break;
++    case AtomicRMWInst::UMin: New = ir.CreateSelect(ir.CreateICmpULT(Old, Val), Old, Val); break;
++    case AtomicRMWInst::Xchg: New = Val; break;
++    default: return unsupported("dxil: unsupported 64-bit atomic operation");
++    }
++  }
++  AtomicCall32("store", Lo, {ir.CreateTrunc(New, I32)}, true);
++  AtomicCall32("store", Hi, {ir.CreateTrunc(ir.CreateLShr(New, 32), I32)}, true);
++  air.CreateAtomicFence(Flags, Scope, false);
++  AtomicCall32("store", Lock, {ir.getInt32(0)}, true);
++  ir.CreateBr(LatchBB);
++
++  ir.SetInsertPoint(LatchBB);
++  auto *Done = ir.CreatePHI(ir.getInt1Ty(), 3);
++  Done->addIncoming(ir.getTrue(), CriticalBB);
++  Done->addIncoming(ir.getFalse(), TryBB);
++  Done->addIncoming(ir.getTrue(), LoopBB);
++  auto *Result = ir.CreatePHI(I64, 3);
++  Result->addIncoming(Old, CriticalBB);
++  Result->addIncoming(WasResult, TryBB);
++  Result->addIncoming(WasResult, LoopBB);
++  WasDone->addIncoming(Done, LatchBB);
++  WasResult->addIncoming(Result, LatchBB);
++  auto *AnyLeft = SimdCall("air.simd_any", ir.getInt1Ty(), {ir.CreateNot(Done)});
++  ir.CreateCondBr(AnyLeft, LoopBB, DoneBB);
++
++  ir.SetInsertPoint(DoneBB);
++  return Result;
++}
++
+ llvm::Expected<llvm::Value *>
+ Converter::EmitDiscard(const CallInst &Call) {
+   auto Cond = Get(Call.getArgOperand(1));
+diff --git a/src/airconv/nt/dxil_converter_base.hpp b/src/airconv/nt/dxil_converter_base.hpp
+index 3a704ea..798009f 100644
+--- a/src/airconv/nt/dxil_converter_base.hpp
++++ b/src/airconv/nt/dxil_converter_base.hpp
+@@ -116,6 +116,21 @@ private:
+   llvm::Value *SimdCall(const std::string &Name, llvm::Type *RetTy, llvm::ArrayRef<llvm::Value *> Args);
+   std::string SimdSuffix(llvm::Type *Ty, bool Signed);
+   llvm::Value *LaneMask(llvm::Type *StructTy, llvm::Value *Mask64);
++
++  // 64-bit atomics (SM 6.6), see EmitAtomic64.
++  bool local_atomic64_locked_ = false;
++  llvm::GlobalVariable *local_atomic64_locks_ = nullptr;
++  void InitializeLocalAtomic64Locks();
++  llvm::Expected<llvm::Value *> EmitAtomic64(
++      llvm::AtomicRMWInst::BinOp Op, llvm::Value *Ptr, llvm::Value *Val, llvm::Value *Compare, bool ResultUsed
++  );
++  llvm::Value *AtomicCall32(llvm::StringRef Op, llvm::Value *Ptr, llvm::ArrayRef<llvm::Value *> Args, bool Void);
+ };
+ 
++// Metal has 64-bit atomics only as unsigned min/max without a result, on device memory. Add/and/or/xor are split
++// into two 32-bit atomics; everything else takes a lock word. True when this operation needs the lock.
++bool Atomic64NeedsLock(llvm::AtomicRMWInst::BinOp Op, bool CompareExchange, bool ResultUsed, bool Threadgroup);
++// The same decision for a dx.op.atomicBinOp / dx.op.atomicCompareExchange call.
++bool DxilAtomic64NeedsLock(const llvm::CallInst &Call);
++
+ } // namespace dxmt::dxil
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index 490b794..b359c56 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -141,11 +141,11 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
+ 
+   Com<MTLD3D12GraphicsPipelineState, false> pso_graphics_;
+   Com<MTLD3D12RootSignature, false> rootsig_graphics_;
+-  uint64_t rootarg_graphics_staging_[64];
++  uint64_t rootarg_graphics_staging_[64 + 3]; // + heap addresses and the atomic lock table
+ 
+   Com<MTLD3D12ComputePipelineState, false> pso_compute_;
+   Com<MTLD3D12RootSignature, false> rootsig_compute_;
+-  uint64_t rootarg_compute_staging_[64];
++  uint64_t rootarg_compute_staging_[64 + 3];
+ 
+   FLOAT blend_factor_[4];
+   UINT8 stencil_ref_;
+@@ -156,6 +156,15 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
+ 
+   void
+   StageHeapAddresses() {
++    uint64_t locks = device_->GetAtomic64LockTableAddress();
++    if (rootsig_graphics_) {
++      rootarg_graphics_staging_[rootsig_graphics_->Atomic64LockQwordOffset] = locks;
++      dirty_state_.set(DirtyState::GraphicsRootArguments);
++    }
++    if (rootsig_compute_) {
++      rootarg_compute_staging_[rootsig_compute_->Atomic64LockQwordOffset] = locks;
++      dirty_state_.set(DirtyState::ComputeRootArguments);
++    }
+     if (rootsig_graphics_ && rootsig_graphics_->HeapQwordOffset != ~0u) {
+       memcpy(&rootarg_graphics_staging_[rootsig_graphics_->HeapQwordOffset], heap_addresses_, sizeof(heap_addresses_));
+       dirty_state_.set(DirtyState::GraphicsRootArguments);
+diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
+index 46bf8b3..b130151 100644
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -32,6 +32,9 @@ namespace dxmt {
+ 
+ const GUID kD3D12DeviceDownlevelUUID = {0x74eaee3f, 0x2f4b, 0x476d, {0x82, 0xba, 0x2b, 0x85, 0xcb, 0x49, 0xe3, 0x10}};
+ 
++// 4096 lock words; shaders pick one by hashing the address (dxil converter, EmitAtomic64).
++constexpr uint64_t kAtomic64LockTableSize = 4096 * sizeof(uint32_t);
++
+ HRESULT PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc);
+ 
+ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device>> {
+@@ -42,6 +45,8 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device>> {
+ 
+   dxmt::mutex residency_lock_;
+   WMT::Reference<WMT::ResidencySet> residency_set_;
++  WMT::Reference<WMT::Buffer> atomic64_locks_;
++  uint64_t atomic64_locks_address_ = 0;
+   std::map<uint64_t, BufferAllocation *> interval_map_;
+ 
+   InternalCommandLibrary command_library;
+@@ -68,6 +73,19 @@ public:
+       ERR("Failed to create MTLResidencySet: ", err.description().getUTF8String());
+       return E_FAIL;
+     }
++    // Lock words for 64-bit atomics (see airconv): zeroed shared memory, resident for every queue.
++    WMTBufferInfo locks_info{};
++    locks_info.length = kAtomic64LockTableSize;
++    locks_info.options = WMTResourceHazardTrackingModeUntracked;
++    atomic64_locks_ = GetMTLDevice().newBuffer(locks_info);
++    if (!atomic64_locks_) {
++      ERR("Failed to create the 64-bit atomic lock table");
++      return E_FAIL;
++    }
++    memset(locks_info.memory.get(), 0, kAtomic64LockTableSize);
++    atomic64_locks_address_ = locks_info.gpu_address;
++    RegisterResidency(atomic64_locks_);
++
+     format_inspector_.Inspect(GetMTLDevice());
+     
+     WMTDepthStencilInfo info{};
+@@ -373,6 +391,24 @@ public:
+       out->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
+       return S_OK;
+     }
++    case D3D12_FEATURE_D3D12_OPTIONS9: {
++      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9))
++        return E_INVALIDARG;
++      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9 *>(pFeatureData);
++      *out = {};
++      // 64-bit atomics on raw/structured buffers are part of SM 6.6; groupshared ones are emulated too. Typed
++      // (R64_UINT texture) ones aren't done yet.
++      out->AtomicInt64OnGroupSharedSupported = TRUE;
++      out->WaveMMATier = D3D12_WAVE_MMA_TIER_NOT_SUPPORTED;
++      return S_OK;
++    }
++    case D3D12_FEATURE_D3D12_OPTIONS11: {
++      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS11))
++        return E_INVALIDARG;
++      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11 *>(pFeatureData);
++      out->AtomicInt64OnDescriptorHeapResourceSupported = FALSE;
++      return S_OK;
++    }
+     case D3D12_FEATURE_SHADER_CACHE: {
+       if (DataSize != sizeof(D3D12_FEATURE_DATA_SHADER_CACHE))
+         return E_INVALIDARG;
+@@ -1238,6 +1274,11 @@ public:
+     return __ret;
+   }
+ 
++  uint64_t
++  GetAtomic64LockTableAddress() {
++    return atomic64_locks_address_;
++  }
++
+   WMT::ResidencySet
+   GetGlobalResidencySet() {
+     return residency_set_;
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index a8e93e2..0d67b3d 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -109,6 +109,8 @@ public:
+   // With CBV_SRV_UAV/SAMPLER_HEAP_DIRECTLY_INDEXED: the resource and sampler heaps' base addresses go in the two
+   // qwords from here (after the parameters). ~0u otherwise.
+   uint32_t HeapQwordOffset = ~0u;
++  // The device's lock table for 64-bit atomics goes in this qword, the last one.
++  uint32_t Atomic64LockQwordOffset;
+ 
+   size_t NumStaticSamplers;
+   uint64_t const *EncodedStaticSamplers;
+@@ -186,6 +188,9 @@ public:
+ 
+   virtual HRESULT UnregisterResidencyAndVA(BufferAllocation *allocation) = 0;
+ 
++  // GPU address of the lock words that shaders use to emulate the 64-bit atomics Metal lacks.
++  virtual uint64_t GetAtomic64LockTableAddress() = 0;
++
+   virtual BufferAllocation *LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset) = 0;
+ 
+   virtual InternalCommandLibrary& GetLib() = 0;
+diff --git a/src/d3d12/d3d12_root_signature.cpp b/src/d3d12/d3d12_root_signature.cpp
+index 79ed182..3d63ed4 100644
+--- a/src/d3d12/d3d12_root_signature.cpp
++++ b/src/d3d12/d3d12_root_signature.cpp
+@@ -460,6 +460,7 @@ public:
+       HeapQwordOffset = total_qwords;
+       UploadQwords = total_qwords + 2;
+     }
++    Atomic64LockQwordOffset = UploadQwords++;
+     ParameterSlots = qword_offsets_.size();
+     SlotQwordOffsets = qword_offsets_.data();
+ 
+-- 
+2.50.1 (Apple Git-155)
+
