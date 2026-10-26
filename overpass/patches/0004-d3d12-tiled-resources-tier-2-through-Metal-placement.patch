@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: McKack <4465550+McKack@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 20:19:21 +0100
-Subject: [PATCH] d3d12: tiled resources tier 2 through Metal placement sparse;
- report feature level 12_0
+Subject: [PATCH 04/14] d3d12: tiled resources tier 2 through Metal placement
+ sparse; report feature level 12_0
 
 Reserved textures (2D, no MSAA) and buffers are Metal placement sparse
 resources with 64 KB pages, the size of D3D12 tiles, and D3D12 heaps can now
@@ -310,10 +310,10 @@ index 981ecdb..340d581 100644
  
    void STDMETHODCALLTYPE
 diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
-index 877986d..46bf8b3 100644
+index ba352a3..5b52961 100644
 --- a/src/d3d12/d3d12_device.cpp
 +++ b/src/d3d12/d3d12_device.cpp
-@@ -246,7 +246,9 @@ public:
+@@ -250,7 +250,9 @@ public:
        D3D_FEATURE_LEVEL max_level = {};
        for (unsigned i = 0; i < out->NumFeatureLevels; i++)
          max_level = std::max(out->pFeatureLevelsRequested[i], max_level);
@@ -324,7 +324,7 @@ index 877986d..46bf8b3 100644
        return S_OK;
      }
      case D3D12_FEATURE_FORMAT_INFO:  {
-@@ -289,7 +291,8 @@ public:
+@@ -293,7 +295,8 @@ public:
        out->DoublePrecisionFloatShaderOps = FALSE;
        out->OutputMergerLogicOp = FALSE;
        out->MinPrecisionSupport = D3D12_SHADER_MIN_PRECISION_SUPPORT_16_BIT;
@@ -334,7 +334,7 @@ index 877986d..46bf8b3 100644
        out->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_2;
        out->PSSpecifiedStencilRefSupported = TRUE;
        out->TypedUAVLoadAdditionalFormats = TRUE;
-@@ -677,9 +680,27 @@ public:
+@@ -682,9 +685,27 @@ public:
        const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState,
        const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **resource
    ) {
@@ -363,7 +363,7 @@ index 877986d..46bf8b3 100644
    HRESULT STDMETHODCALLTYPE
    CreateSharedHandle(
        ID3D12DeviceChild *object, const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, HANDLE *handle
-@@ -850,7 +871,11 @@ public:
+@@ -855,7 +876,11 @@ public:
        D3D12_TILE_SHAPE *StandardTileShape, UINT *SubresourceTilingCount, UINT FirstSubresourceTiling,
        D3D12_SUBRESOURCE_TILING *SubresourceTilings
    ) {
@@ -376,7 +376,7 @@ index 877986d..46bf8b3 100644
    };
  
    LUID *STDMETHODCALLTYPE
-@@ -1149,7 +1174,9 @@ public:
+@@ -1154,7 +1179,9 @@ public:
        const D3D12_CLEAR_VALUE *OptimizedClearValue, ID3D12ProtectedResourceSession *pSession, REFIID riid,
        void **ppResource
    ) {
@@ -388,7 +388,7 @@ index 877986d..46bf8b3 100644
  
    D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE
 diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
-index 3af4bb4..a7b63d8 100644
+index f8a3bf0..ca2132f 100644
 --- a/src/d3d12/d3d12_device.hpp
 +++ b/src/d3d12/d3d12_device.hpp
 @@ -20,6 +20,7 @@
@@ -408,7 +408,7 @@ index 3af4bb4..a7b63d8 100644
  
    virtual HRESULT STDMETHODCALLTYPE
    CreateShaderResourceView(const D3D12_SHADER_RESOURCE_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Descriptor) = 0;
-@@ -242,6 +245,18 @@ CreatePlacedBuffer(
+@@ -246,6 +249,18 @@ CreatePlacedBuffer(
      D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
  );
  
@@ -428,7 +428,7 @@ index 3af4bb4..a7b63d8 100644
  CreateHeap(MTLD3D12Device *pDevice, const D3D12_HEAP_DESC *pDesc, REFIID riid, void **ppHeap);
  
 diff --git a/src/d3d12/d3d12_heap.cpp b/src/d3d12/d3d12_heap.cpp
-index 2448ed0..444dab3 100644
+index eb910d7..dc14023 100644
 --- a/src/d3d12/d3d12_heap.cpp
 +++ b/src/d3d12/d3d12_heap.cpp
 @@ -86,6 +86,9 @@ public:
@@ -440,7 +440,7 @@ index 2448ed0..444dab3 100644
 +        device_->GetMTLDevice().supportsPlacementSparse() ? WMTSparsePageSize64 : WMTSparsePageSize(0);
  
      heap = device_->GetMTLDevice().newHeap(info);
- 
+     if (!heap)
 diff --git a/src/d3d12/d3d12_texture.cpp b/src/d3d12/d3d12_texture.cpp
 index 5d29ca1..f92ca40 100644
 --- a/src/d3d12/d3d12_texture.cpp
@@ -992,10 +992,10 @@ index 8224a0c..2c3fb96 100644
    heapBufferSizeAndAlign(uint64_t length, WMTResourceOptions options) {
      return MTLDevice_heapBufferSizeAndAlign(handle, length, options);
 diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
-index 3327b29..fee631f 100644
+index 2776e47..0b379a4 100644
 --- a/src/winemetal/unix/winemetal_unix.c
 +++ b/src/winemetal/unix/winemetal_unix.c
-@@ -3010,6 +3010,10 @@ _MTLDevice_newHeap(void *obj) {
+@@ -3025,6 +3025,10 @@ _MTLDevice_newHeap(void *obj) {
    desc.sparsePageSize = (MTLSparsePageSize)info->sparse_page_size;
    desc.type = (MTLHeapType)info->type;
    desc.size = info->size;
@@ -1006,7 +1006,7 @@ index 3327b29..fee631f 100644
  
    params->ret = (obj_handle_t)[device newHeapWithDescriptor:desc];
  
-@@ -3163,6 +3167,154 @@ NTSTATUS _CacheWriter_alloc_init(void *obj);
+@@ -3181,6 +3185,154 @@ NTSTATUS _CacheWriter_alloc_init(void *obj);
  NTSTATUS _CacheWriter_set(void *obj);
  NTSTATUS _WMTSetMetalShaderCachePath(void *obj);
  
@@ -1161,7 +1161,7 @@ index 3327b29..fee631f 100644
  const void *__wine_unix_call_funcs[] = {
      &_NSObject_retain,
      &_NSObject_release,
-@@ -3310,6 +3462,18 @@ const void *__wine_unix_call_funcs[] = {
+@@ -3328,6 +3480,18 @@ const void *__wine_unix_call_funcs[] = {
      &_MTLDevice_newIndirectCommandBuffer,
      &_MTLDevice_newLibraryWithSource,
      &_MTLTexture_getBytes,
@@ -1180,7 +1180,7 @@ index 3327b29..fee631f 100644
  };
  
  #ifndef DXMT_NATIVE
-@@ -3460,5 +3624,17 @@ const void *__wine_unix_call_wow64_funcs[] = {
+@@ -3478,5 +3642,17 @@ const void *__wine_unix_call_wow64_funcs[] = {
      &_MTLDevice_newIndirectCommandBuffer,
      &_MTLDevice_newLibraryWithSource,
      &_MTLTexture_getBytes,

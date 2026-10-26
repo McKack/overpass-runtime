@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: McKack <4465550+McKack@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 22:53:38 +0100
-Subject: [PATCH] airconv, d3d12: SM 6.6 descriptor heap indexing
+Subject: [PATCH 09/14] airconv, d3d12: SM 6.6 descriptor heap indexing
  (ResourceDescriptorHeap, SamplerDescriptorHeap)
 
 Root signatures with CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED or
@@ -66,7 +66,7 @@ index ad93df1..b506c3d 100644
  
    binding_map->RootSignatureArgumentIndex = func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
 diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
-index a99b46f..17e98e6 100644
+index c749918..f828f7c 100644
 --- a/src/airconv/dxil_converter.cpp
 +++ b/src/airconv/dxil_converter.cpp
 @@ -78,6 +78,24 @@ to_shader_resource_type(ResourceKind kind) {
@@ -107,7 +107,7 @@ index a99b46f..17e98e6 100644
        return unsupported("dxil: unsupported resource handle operation " + name.str());
      }
    }
-@@ -669,6 +690,59 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
+@@ -807,6 +828,59 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
      }
    }
  
@@ -168,7 +168,7 @@ index a99b46f..17e98e6 100644
      for (auto &inst : bb) {
        auto *ci = dyn_cast<CallInst>(&inst);
 diff --git a/src/airconv/dxil_metadata.hpp b/src/airconv/dxil_metadata.hpp
-index fd48e1b..604c607 100644
+index bb1f7a1..ef63ee3 100644
 --- a/src/airconv/dxil_metadata.hpp
 +++ b/src/airconv/dxil_metadata.hpp
 @@ -64,6 +64,45 @@ enum class ResourceClass : uint8_t {
@@ -218,7 +218,7 @@ index fd48e1b..604c607 100644
    TypedBufferElementType = 0,
    StructuredBufferElementStride = 1,
 diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
-index 6a8eb4f..0722000 100644
+index 8c7b960..7e3250b 100644
 --- a/src/airconv/nt/dxil_converter_base.cpp
 +++ b/src/airconv/nt/dxil_converter_base.cpp
 @@ -791,6 +791,13 @@ Converter::EmitDxilOp(CallInst &Call) {
@@ -235,7 +235,7 @@ index 6a8eb4f..0722000 100644
    if (op == "cbufferLoadLegacy")
      return EmitCbufferLoadLegacy(Call);
    if (op == "threadId")
-@@ -934,6 +941,23 @@ Converter::EmitCreateHandleFromBinding(CallInst &Call) {
+@@ -951,6 +958,23 @@ Converter::EmitCreateHandleFromBinding(CallInst &Call) {
  // SM 6.6: annotateHandle(handle, %dx.types.ResourceProperties) describes a handle; it is the same resource.
  llvm::Expected<llvm::Value *>
  Converter::EmitAnnotateHandle(CallInst &Call) {
@@ -272,10 +272,10 @@ index 67a0148..ca13f52 100644
    llvm::Type *MapType(llvm::Type *Type);
    llvm::Expected<llvm::Constant *> MapConstantExpr(llvm::ConstantExpr *Expr);
 diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
-index 7b370b6..490b794 100644
+index e68dd36..4ee33b1 100644
 --- a/src/d3d12/d3d12_command_list.cpp
 +++ b/src/d3d12/d3d12_command_list.cpp
-@@ -150,6 +150,22 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
+@@ -231,6 +231,22 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
    FLOAT blend_factor_[4];
    UINT8 stencil_ref_;
  
@@ -298,7 +298,7 @@ index 7b370b6..490b794 100644
    // IMTLD3D12CommandListExt, used by nvngx for DLSS -> MetalFX.
    class CommandListExt final : public IMTLD3D12CommandListExt {
      MTLD3D12GraphicsCommandListImpl *list_;
-@@ -379,6 +395,8 @@ public:
+@@ -460,6 +476,8 @@ public:
  
      memset(vertex_buffers_.data(), 0, sizeof(vertex_buffers_));
  
@@ -307,7 +307,7 @@ index 7b370b6..490b794 100644
      index_buffer_address = 0;
      index_buffer = {};
      index_type = {};
-@@ -1221,7 +1239,20 @@ public:
+@@ -1406,7 +1424,20 @@ public:
    void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *CommandList) { IMPLEMENT_ME };
  
    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT HeapCount, ID3D12DescriptorHeap *const *Heaps) {
@@ -329,7 +329,7 @@ index 7b370b6..490b794 100644
    };
  
    void STDMETHODCALLTYPE
-@@ -1234,6 +1265,7 @@ public:
+@@ -1419,6 +1450,7 @@ public:
      } else {
        rootsig_compute_ = nullptr;
      }
@@ -337,7 +337,7 @@ index 7b370b6..490b794 100644
      dirty_state_.set(DirtyState::ComputeRootArguments, DirtyState::ComputeRootSignature);
    };
  
-@@ -1247,6 +1279,7 @@ public:
+@@ -1432,6 +1464,7 @@ public:
      } else {
        rootsig_graphics_ = nullptr;
      }
@@ -346,7 +346,7 @@ index 7b370b6..490b794 100644
    };
  
 diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
-index a7b63d8..a8e93e2 100644
+index ca2132f..6ebba1b 100644
 --- a/src/d3d12/d3d12_device.hpp
 +++ b/src/d3d12/d3d12_device.hpp
 @@ -106,6 +106,9 @@ public:

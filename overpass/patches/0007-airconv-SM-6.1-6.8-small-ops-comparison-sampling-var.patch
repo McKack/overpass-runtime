@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: McKack <4465550+McKack@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 22:40:51 +0100
-Subject: [PATCH] airconv: SM 6.1-6.8 small ops: comparison sampling variants,
- raw gather, packed math, ViewID, start vertex/instance
+Subject: [PATCH 07/14] airconv: SM 6.1-6.8 small ops: comparison sampling
+ variants, raw gather, packed math, ViewID, start vertex/instance
 
 SampleCmpLevel, SampleCmpBias and SampleCmpGrad map to Metal sample_compare
 (gradients through a new reference argument on the gradient sample);
@@ -20,10 +20,10 @@ opcodes, so their textures get the right Metal type.
  5 files changed, 166 insertions(+), 11 deletions(-)
 
 diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
-index ef7fe61..a99b46f 100644
+index b7fd7aa..c749918 100644
 --- a/src/airconv/dxil_converter.cpp
 +++ b/src/airconv/dxil_converter.cpp
-@@ -738,11 +738,15 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
+@@ -876,11 +876,15 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
        case kOpSampleLevel:
        case kOpSampleGrad:
        case kOpTextureGather:
@@ -40,7 +40,7 @@ index ef7fe61..a99b46f 100644
          if (auto err = record_usage(false, false, true, true))
            return err;
 diff --git a/src/airconv/nt/air_builder.cpp b/src/airconv/nt/air_builder.cpp
-index f56d7fa..bf31216 100644
+index 0f2601f..29a8936 100644
 --- a/src/airconv/nt/air_builder.cpp
 +++ b/src/airconv/nt/air_builder.cpp
 @@ -523,7 +523,7 @@ AIRBuilder::CreateSampleCmpCommon(
@@ -74,7 +74,7 @@ index f56d7fa..bf31216 100644
    FnName += "_grad";
    FnName += getTypeOverloadSuffix(getTexelType(Texture), getTexelSign(Texture));
 diff --git a/src/airconv/nt/air_builder.hpp b/src/airconv/nt/air_builder.hpp
-index 72d9bf5..170ff2a 100644
+index 3a7feae..06e799b 100644
 --- a/src/airconv/nt/air_builder.hpp
 +++ b/src/airconv/nt/air_builder.hpp
 @@ -189,9 +189,10 @@ public:
@@ -90,7 +90,7 @@ index 72d9bf5..170ff2a 100644
  
    Value *CreateAtomicRMW(
 diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
-index dd2c7e3..c4f5070 100644
+index f790567..574dc61 100644
 --- a/src/airconv/nt/dxil_converter_base.cpp
 +++ b/src/airconv/nt/dxil_converter_base.cpp
 @@ -830,8 +830,18 @@ Converter::EmitDxilOp(CallInst &Call) {
@@ -113,7 +113,7 @@ index dd2c7e3..c4f5070 100644
    if (op == "textureGather" || op == "textureGatherCmp")
      return EmitGather(Call, op);
    if (op == "unary")
-@@ -1732,6 +1742,51 @@ Converter::EmitSample(const CallInst &Call, StringRef Op) {
+@@ -1761,6 +1771,51 @@ Converter::EmitSample(const CallInst &Call, StringRef Op) {
          Texture, TextureDescriptor->ResourceHandle, Sampler, Coord, Array, *Reference, Offset,
          sample_level{air.getFloat(0)}
      );
@@ -165,7 +165,7 @@ index dd2c7e3..c4f5070 100644
    } else if (Op == "sampleCmp") {
      auto Reference = Get(Call.getArgOperand(10));
      if (!Reference)
-@@ -1821,25 +1876,32 @@ Converter::EmitGather(const CallInst &Call, StringRef Op) {
+@@ -1850,25 +1905,32 @@ Converter::EmitGather(const CallInst &Call, StringRef Op) {
    auto Texture = MakeTexture(*TextureDescriptor);
    auto Sampler = SamplerDescriptor->SamplerHandle;
  
@@ -205,7 +205,7 @@ index dd2c7e3..c4f5070 100644
    if (!Component)
      return Component.takeError();
  
-@@ -1894,6 +1956,15 @@ Converter::EmitGather(const CallInst &Call, StringRef Op) {
+@@ -1923,6 +1985,15 @@ Converter::EmitGather(const CallInst &Call, StringRef Op) {
    }
    if (!Value)
      return unsupported("dxil: gather operation failed");
@@ -221,7 +221,7 @@ index dd2c7e3..c4f5070 100644
    // Metal depth texture must use float type, resolve potential type mismatch here
    if (Call.getType()->getStructElementType(0)->isHalfTy())
      Value = air.CreateConvertToHalf(Value);
-@@ -2639,4 +2710,77 @@ Converter::EmitWaveOp(const CallInst &Call, StringRef Op) {
+@@ -2668,4 +2739,77 @@ Converter::EmitWaveOp(const CallInst &Call, StringRef Op) {
    return unsupported("dxil: unsupported operation dx.op." + Op.str());
  }
  

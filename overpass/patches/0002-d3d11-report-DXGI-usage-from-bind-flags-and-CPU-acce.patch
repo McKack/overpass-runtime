@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: McKack <4465550+McKack@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 19:20:19 +0100
-Subject: [PATCH] d3d11: report DXGI usage from bind flags and CPU access
+Subject: [PATCH 02/14] d3d11: report DXGI usage from bind flags and CPU access
 
 IDXGIResource::GetUsage always returned 0. ANGLE checks the result for
 DXGI_USAGE_RENDER_TARGET_OUTPUT before rendering into a texture it is handed,

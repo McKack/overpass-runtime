@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: McKack <4465550+McKack@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 22:42:31 +0100
-Subject: [PATCH] airconv: derivatives outside pixel shaders; tan computed sin
+Subject: [PATCH 08/14] airconv: derivatives outside pixel shaders; tan
+ computed sin
 
 SM 6.6 compute shaders may take derivatives over 2x2 thread quads. Metal has
 dfdx/dfdy only in fragment functions, so outside pixel shaders a derivative is
@@ -16,10 +17,10 @@ Also fixes the DXIL tan op, which was translated to sin.
  2 files changed, 39 insertions(+), 1 deletion(-)
 
 diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
-index c4f5070..6a8eb4f 100644
+index 574dc61..8c7b960 100644
 --- a/src/airconv/nt/dxil_converter_base.cpp
 +++ b/src/airconv/nt/dxil_converter_base.cpp
-@@ -1994,6 +1994,8 @@ Converter::EmitUnary(const CallInst &Call) {
+@@ -2023,6 +2023,8 @@ Converter::EmitUnary(const CallInst &Call) {
    case kOpDerivFineY:
      if (!(*Operand)->getType()->isFloatingPointTy())
        return unsupported("dxil: derivative on a non-float operand");
@@ -28,7 +29,7 @@ index c4f5070..6a8eb4f 100644
      return air.CreateDerivative(*Operand, OpId == kOpDerivCoarseY || OpId == kOpDerivFineY);
    case kOpFAbs:
      FPUnOp = AIRBuilder::fabs;
-@@ -2008,7 +2010,7 @@ Converter::EmitUnary(const CallInst &Call) {
+@@ -2037,7 +2039,7 @@ Converter::EmitUnary(const CallInst &Call) {
      FPUnOp = AIRBuilder::sin;
      break;
    case kOpTan:
@@ -37,7 +38,7 @@ index c4f5070..6a8eb4f 100644
      break;
    case kOpAcos:
      FPUnOp = AIRBuilder::acos;
-@@ -2783,4 +2785,39 @@ Converter::EmitPackedMath(const CallInst &Call) {
+@@ -2812,4 +2814,39 @@ Converter::EmitPackedMath(const CallInst &Call) {
    }
  }
  

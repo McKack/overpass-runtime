@@ -5,6 +5,12 @@ OverPass Runtime is DXMT at the commit pinned in `dxmt/`, plus the patches in `p
 New patches: change `dxmt/`, then `overpass/make-patch.sh "subject" "body"` writes the next numbered patch from it.
 To start over from a clean DXMT, run `git -C dxmt checkout -- . && git -C dxmt clean -fd`.
 
+Pinned: DXMT main at 9839e55 (2026-10-26). The patches were moved there from a148782 (2026-10-06), when DXMT
+gained D3D12 geometry shaders, `SV_PrimitiveID`, `WriteBufferImmediate` and the minimum feature level. Where
+both did the same job, DXMT's code was kept: mesh pipelines bind root arguments to the object and mesh stages
+the way DXMT's geometry pipelines now do, and `GetAttributeAtVertex` goes through DXMT's input indexing
+for geometry shaders (its vertex operand isn't a geometry shader vertex).
+
 | Patch | What it does |
 |---|---|
 | `0001-nvapi-add-D3D12-DRS-D3D11-device-creation-and-GPU-di.patch` | Adds 36 NVAPI functions: D3D12 (shader extension and raytracing caps, Reflex queue calls, pipeline options), DRS sessions and profiles, `NvAPI_D3D11_CreateDevice(AndSwapChain)`, `NvAPI_D3D_RegisterDevice`, and GPU/display lookups (PCI IDs, GPU type and info, GPU IDs, logical/physical GPUs, display names). Behaviour adapted from dxvk-nvapi (MIT); the notice is kept in `src/nvapi/nvapi_ported.cpp`. |
@@ -22,4 +28,4 @@ To start over from a clean DXMT, run `git -C dxmt checkout -- . && git -C dxmt c
 | `0013-airconv-d3d12-mesh-and-amplification-shaders.patch` | Mesh shaders become Metal mesh functions and amplification shaders Metal object functions. D3D12 gets mesh pipelines from pipeline state streams, `ID3D12GraphicsCommandList3` to `6`, `DispatchMesh` and render passes, and reports mesh shader tier 1. Measured with `tests/sm6/`: 26 of 27 features. `tests/mesh12.cpp` draws with `DispatchMesh` in a render pass and checks pixels: per-vertex colour, per-primitive id, payload, `SV_CullPrimitive` and root constants in the mesh and object stages. |
 | `0014-d3d12-report-shader-model-6.8-and-wave-ops.patch` | `CheckFeatureSupport(SHADER_MODEL)` answers any model from 5.1 to 6.9 with the lower of it and 6.8, instead of failing above 6.0. OPTIONS1 reports wave ops with 32 lanes. Verified: `tests/smoke.c` reports shader model 0x68. |
 
-Verify with `tests/smoke.c`, `tests/dlss12.cpp` (`dlss12.exe` and `dlss12.exe hires-mv`), `tests/tiled12.cpp`, `tests/heap12.cpp`, `tests/bary12.cpp`, `tests/atomic12.cpp` and `tests/mesh12.cpp`, run with `DXMT_ENABLE_NVEXT=1`. Each `.hlsl` next to its `.cpp` is compiled with DXC; see the comment at the top of each `.cpp`. Shader model coverage is in `tests/sm6/` (`run.py`, see `tests/sm6/README.md`).
+Verify with `tests/smoke.c`, `tests/dlss12.cpp` (`dlss12.exe` and `dlss12.exe hires-mv`), `tests/tiled12.cpp`, `tests/heap12.cpp`, `tests/bary12.cpp`, `tests/atomic12.cpp`, `tests/mesh12.cpp` and `tests/gs12.cpp` (DXMT's geometry shaders with our changes around them), run with `DXMT_ENABLE_NVEXT=1`. Each `.hlsl` next to its `.cpp` is compiled with DXC; see the comment at the top of each `.cpp`. Shader model coverage is in `tests/sm6/` (`run.py`, see `tests/sm6/README.md`). `tests/run-all.sh` builds and runs all of them, DXC and a Wine prefix included, in `../testenv`.

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: McKack <4465550+McKack@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 21:28:35 +0100
-Subject: [PATCH] airconv: DXIL wave and quad vote operations
+Subject: [PATCH 06/14] airconv: DXIL wave and quad vote operations
 
 Wave operations map to Metal SIMD-group functions: active sum/product/min/max,
 prefix sum/product, and/or/xor, ballot, read first lane, any/all/all-equal,
@@ -15,7 +15,7 @@ function names across them.
  2 files changed, 262 insertions(+)
 
 diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
-index 5a55028..dd2c7e3 100644
+index 8af1e00..f790567 100644
 --- a/src/airconv/nt/dxil_converter_base.cpp
 +++ b/src/airconv/nt/dxil_converter_base.cpp
 @@ -868,6 +868,8 @@ Converter::EmitDxilOp(CallInst &Call) {
@@ -27,7 +27,7 @@ index 5a55028..dd2c7e3 100644
    if (op == "sampleIndex")
      return ctx.resource.sample_index_arg;
    if (op == "coverage")
-@@ -2381,4 +2383,260 @@ Converter::EmitQuadOp(const CallInst &Call) {
+@@ -2410,4 +2412,260 @@ Converter::EmitQuadOp(const CallInst &Call) {
    return air.CreateQuadShuffleXor(*Value, *Kind + 1);
  }
  

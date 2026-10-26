@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: McKack <4465550+McKack@users.noreply.github.com>
 Date: Mon, 26 Oct 2026 01:18:29 +0100
-Subject: [PATCH] airconv, d3d12: 64-bit atomics on buffers and groupshared
- memory
+Subject: [PATCH 11/14] airconv, d3d12: 64-bit atomics on buffers and
+ groupshared memory
 
 Metal has 64-bit atomics only as unsigned min/max without a result, on device
 memory; those map to it directly. Add, and, or and xor are split into two
@@ -99,10 +99,10 @@ index b506c3d..5d4c6b7 100644
  
    binding_map->RootSignatureArgumentIndex = func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
 diff --git a/src/airconv/dxbc_converter.hpp b/src/airconv/dxbc_converter.hpp
-index fc1fa36..bb13a66 100644
+index 238ff2d..b84f625 100644
 --- a/src/airconv/dxbc_converter.hpp
 +++ b/src/airconv/dxbc_converter.hpp
-@@ -105,6 +105,7 @@ public:
+@@ -104,6 +104,7 @@ public:
    bool output_control_point_read = false;
    bool use_msad = false;
    bool use_samplepos = false;
@@ -111,10 +111,10 @@ index fc1fa36..bb13a66 100644
    uint32_t pull_mode_reg_mask = 0;
  };
 diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
-index 61da07f..99bdd64 100644
+index 3e4e579..af8edb4 100644
 --- a/src/airconv/dxil_converter.cpp
 +++ b/src/airconv/dxil_converter.cpp
-@@ -864,6 +864,7 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
+@@ -1002,6 +1002,7 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
        case kOpAtomicCmpXchg:
          if (auto err = record_usage(true, true, false, false))
            return err;
@@ -140,7 +140,7 @@ index c92b050..56d13f4 100644
  } // namespace dxmt::dxbc
 \ No newline at end of file
 diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
-index 973a89b..c5a88b4 100644
+index fb06eb5..983872a 100644
 --- a/src/airconv/nt/dxil_converter_base.cpp
 +++ b/src/airconv/nt/dxil_converter_base.cpp
 @@ -66,6 +66,8 @@ Converter::Run(llvm::BasicBlock *ReturnBB) {
@@ -196,7 +196,7 @@ index 973a89b..c5a88b4 100644
    default:
      return unsupported(std::string("dxil: unsupported instruction: ") + Inst->getOpcodeName());
    }
-@@ -2275,6 +2309,10 @@ Converter::EmitAtomicRMW(const CallInst &Call) {
+@@ -2304,6 +2338,10 @@ Converter::EmitAtomicRMW(const CallInst &Call) {
      }
      auto Index = ir.CreateLShr(ByteOffset, ir.getInt32(2));
      auto *Ptr = ir.CreateGEP(ir.getInt32Ty(), Buffer->Pointer, {Index});
@@ -207,7 +207,7 @@ index 973a89b..c5a88b4 100644
      auto Value = air.CreateAtomicRMW(BinOp, Ptr, *NewValue);
      if (!Value)
        return unsupported("dxil: atomic operation failed");
-@@ -2336,6 +2374,10 @@ Converter::EmitAtomicCmpXchg(const CallInst &Call) {
+@@ -2365,6 +2403,10 @@ Converter::EmitAtomicCmpXchg(const CallInst &Call) {
      }
      auto Index = ir.CreateLShr(ByteOffset, ir.getInt32(2));
      auto *Ptr = ir.CreateGEP(ir.getInt32Ty(), Buffer->Pointer, {Index});
@@ -218,7 +218,7 @@ index 973a89b..c5a88b4 100644
      auto Result = ir.CreateAtomicCmpXchg(
          Ptr, *Compare, *NewValue, MaybeAlign(), AtomicOrdering::Monotonic, AtomicOrdering::Monotonic
      );
-@@ -2371,6 +2413,231 @@ Converter::EmitAtomicCmpXchg(const CallInst &Call) {
+@@ -2400,6 +2442,231 @@ Converter::EmitAtomicCmpXchg(const CallInst &Call) {
    return ir.CreateExtractElement(Result, 0ull);
  }
  
@@ -477,10 +477,10 @@ index 3a704ea..798009f 100644
 +
  } // namespace dxmt::dxil
 diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
-index 490b794..b359c56 100644
+index 4ee33b1..98f78a9 100644
 --- a/src/d3d12/d3d12_command_list.cpp
 +++ b/src/d3d12/d3d12_command_list.cpp
-@@ -141,11 +141,11 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
+@@ -222,11 +222,11 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
  
    Com<MTLD3D12GraphicsPipelineState, false> pso_graphics_;
    Com<MTLD3D12RootSignature, false> rootsig_graphics_;
@@ -494,7 +494,7 @@ index 490b794..b359c56 100644
  
    FLOAT blend_factor_[4];
    UINT8 stencil_ref_;
-@@ -156,6 +156,15 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
+@@ -237,6 +237,15 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
  
    void
    StageHeapAddresses() {
@@ -511,7 +511,7 @@ index 490b794..b359c56 100644
        memcpy(&rootarg_graphics_staging_[rootsig_graphics_->HeapQwordOffset], heap_addresses_, sizeof(heap_addresses_));
        dirty_state_.set(DirtyState::GraphicsRootArguments);
 diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
-index 46bf8b3..b130151 100644
+index 5b52961..54e1472 100644
 --- a/src/d3d12/d3d12_device.cpp
 +++ b/src/d3d12/d3d12_device.cpp
 @@ -32,6 +32,9 @@ namespace dxmt {
@@ -533,7 +533,7 @@ index 46bf8b3..b130151 100644
    std::map<uint64_t, BufferAllocation *> interval_map_;
  
    InternalCommandLibrary command_library;
-@@ -68,6 +73,19 @@ public:
+@@ -72,6 +77,19 @@ public:
        ERR("Failed to create MTLResidencySet: ", err.description().getUTF8String());
        return E_FAIL;
      }
@@ -553,7 +553,7 @@ index 46bf8b3..b130151 100644
      format_inspector_.Inspect(GetMTLDevice());
      
      WMTDepthStencilInfo info{};
-@@ -373,6 +391,24 @@ public:
+@@ -378,6 +396,24 @@ public:
        out->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
        return S_OK;
      }
@@ -578,7 +578,7 @@ index 46bf8b3..b130151 100644
      case D3D12_FEATURE_SHADER_CACHE: {
        if (DataSize != sizeof(D3D12_FEATURE_DATA_SHADER_CACHE))
          return E_INVALIDARG;
-@@ -1238,6 +1274,11 @@ public:
+@@ -1243,6 +1279,11 @@ public:
      return __ret;
    }
  
@@ -591,7 +591,7 @@ index 46bf8b3..b130151 100644
    GetGlobalResidencySet() {
      return residency_set_;
 diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
-index a8e93e2..0d67b3d 100644
+index 6ebba1b..7c7c287 100644
 --- a/src/d3d12/d3d12_device.hpp
 +++ b/src/d3d12/d3d12_device.hpp
 @@ -109,6 +109,8 @@ public:
@@ -603,7 +603,7 @@ index a8e93e2..0d67b3d 100644
  
    size_t NumStaticSamplers;
    uint64_t const *EncodedStaticSamplers;
-@@ -186,6 +188,9 @@ public:
+@@ -189,6 +191,9 @@ public:
  
    virtual HRESULT UnregisterResidencyAndVA(BufferAllocation *allocation) = 0;
  

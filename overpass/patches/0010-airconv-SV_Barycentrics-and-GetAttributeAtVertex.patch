@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: McKack <4465550+McKack@users.noreply.github.com>
 Date: Mon, 26 Oct 2026 00:35:32 +0100
-Subject: [PATCH] airconv: SV_Barycentrics and GetAttributeAtVertex
+Subject: [PATCH 10/14] airconv: SV_Barycentrics and GetAttributeAtVertex
 
 SV_Barycentrics maps to [[barycentric_coord]] and gets a register after the packed inputs.
 GetAttributeAtVertex on float inputs: the input is read without perspective (pull mode) together with
@@ -15,12 +15,12 @@ compiles on Apple9 but returns wrong data). Integer and half inputs get the flat
  src/airconv/dxil_metadata.hpp          |  3 ++
  src/airconv/nt/dxbc_io_helper.cpp      | 51 ++++++++++++++++++++-
  src/airconv/nt/dxbc_io_helper.hpp      |  9 ++++
- src/airconv/nt/dxil_converter_base.cpp | 28 +++++++++---
+ src/airconv/nt/dxil_converter_base.cpp | 24 ++++++++--
  src/airconv/nt/dxil_converter_base.hpp |  2 +-
- 8 files changed, 164 insertions(+), 10 deletions(-)
+ 8 files changed, 162 insertions(+), 8 deletions(-)
 
 diff --git a/src/airconv/air_signature.cpp b/src/airconv/air_signature.cpp
-index 6bba459..1954d1d 100644
+index 21052ef..806d2c6 100644
 --- a/src/airconv/air_signature.cpp
 +++ b/src/airconv/air_signature.cpp
 @@ -454,6 +454,10 @@ uint32_t FunctionSignatureBuilder::DefineInput(const FunctionInput &input) {
@@ -34,7 +34,7 @@ index 6bba459..1954d1d 100644
                [&](const ArgumentBindingBuffer s) {
                  return s.location_index ==
                         std::get<ArgumentBindingBuffer>(element.value())
-@@ -696,6 +700,15 @@ auto FunctionSignatureBuilder::CreateFunction(
+@@ -703,6 +707,15 @@ auto FunctionSignatureBuilder::CreateFunction(
  
            return msl_float4.get_llvm_type(context);
          },
@@ -51,7 +51,7 @@ index 6bba459..1954d1d 100644
            metadata_field.string("air.front_facing")
              ->string("air.arg_type_name")
 diff --git a/src/airconv/air_signature.hpp b/src/airconv/air_signature.hpp
-index a050f2c..b117801 100644
+index 42af8c5..b3b9336 100644
 --- a/src/airconv/air_signature.hpp
 +++ b/src/airconv/air_signature.hpp
 @@ -518,6 +518,10 @@ struct InputFragmentStageIn {
@@ -65,7 +65,7 @@ index a050f2c..b117801 100644
  struct InputVertexID {};
  struct InputBaseVertex {};
  struct InputInstanceID {};
-@@ -610,7 +614,7 @@ using FunctionInput = template_concat_t<
+@@ -614,7 +618,7 @@ using FunctionInput = template_concat_t<
      /* fragment */
      InputPrimitiveID, InputViewportArrayIndex, InputRenderTargetArrayIndex,
      InputFrontFacing, InputPosition, InputSampleIndex, //
@@ -75,7 +75,7 @@ index a050f2c..b117801 100644
      InputPayload, InputMeshGridProperties, InputMesh,
      /* kernel */
 diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
-index 17e98e6..61da07f 100644
+index f828f7c..3e4e579 100644
 --- a/src/airconv/dxil_converter.cpp
 +++ b/src/airconv/dxil_converter.cpp
 @@ -11,6 +11,7 @@
@@ -182,7 +182,7 @@ index 17e98e6..61da07f 100644
        shader->signature_handlers.push_back([=](SignatureContext &ctx) {
          uint32_t arg = ctx.func_signature.DefineInput(air::InputFrontFacing{});
 diff --git a/src/airconv/dxil_metadata.hpp b/src/airconv/dxil_metadata.hpp
-index 604c607..ff37709 100644
+index ef63ee3..7920fbb 100644
 --- a/src/airconv/dxil_metadata.hpp
 +++ b/src/airconv/dxil_metadata.hpp
 @@ -175,6 +175,9 @@ struct SignatureElement {
@@ -196,7 +196,7 @@ index 604c607..ff37709 100644
  
  enum class EntryPropertyTag : uint32_t {
 diff --git a/src/airconv/nt/dxbc_io_helper.cpp b/src/airconv/nt/dxbc_io_helper.cpp
-index bf356cf..4359832 100644
+index 624cba4..974acb7 100644
 --- a/src/airconv/nt/dxbc_io_helper.cpp
 +++ b/src/airconv/nt/dxbc_io_helper.cpp
 @@ -123,7 +123,56 @@ IOHelper::StoreAtVec4ArrayMasked(llvm::Value *array, llvm::Value *index, llvm::V
@@ -258,7 +258,7 @@ index bf356cf..4359832 100644
    auto ToInt32 = [this](llvm::Value *Value) -> llvm::Expected<llvm::Value *> {
      if (Value->getType()->getScalarType() == types._int)
 diff --git a/src/airconv/nt/dxbc_io_helper.hpp b/src/airconv/nt/dxbc_io_helper.hpp
-index 2c8fcda..c4e965c 100644
+index deeb400..6f6a35c 100644
 --- a/src/airconv/nt/dxbc_io_helper.hpp
 +++ b/src/airconv/nt/dxbc_io_helper.hpp
 @@ -23,6 +23,15 @@ public:
@@ -278,7 +278,7 @@ index 2c8fcda..c4e965c 100644
        uint32_t FromFunctionArgumentIndex, uint32_t ToRegister, uint32_t Mask,
        air::Interpolation Interpolation, uint32_t AtSampleIndex
 diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
-index 0722000..973a89b 100644
+index 7e3250b..fb06eb5 100644
 --- a/src/airconv/nt/dxil_converter_base.cpp
 +++ b/src/airconv/nt/dxil_converter_base.cpp
 @@ -834,6 +834,8 @@ Converter::EmitDxilOp(CallInst &Call) {
@@ -290,7 +290,7 @@ index 0722000..973a89b 100644
    if (op == "storeOutput")
      return EmitStoreOutput(Call);
    if (op == "sample" || op == "sampleLevel" || op == "sampleBias" || op == "sampleCmp" || op == "sampleCmpLevelZero" ||
-@@ -1499,7 +1501,7 @@ Converter::EmitBarrier(CallInst &Call) {
+@@ -1516,7 +1518,7 @@ Converter::EmitBarrier(CallInst &Call) {
  }
  
  llvm::Expected<llvm::Value *>
@@ -299,15 +299,15 @@ index 0722000..973a89b 100644
    auto Element = asU32(Call.getArgOperand(1));
    auto Row = asU32(Call.getArgOperand(2));
    auto Component = asU32(Call.getArgOperand(3));
-@@ -1522,6 +1524,7 @@ Converter::EmitLoadInput(const CallInst &Call) {
-   case SemanticKind::ViewPortArrayIndex:
+@@ -1545,6 +1547,7 @@ Converter::EmitLoadInput(const CallInst &Call) {
    case SemanticKind::ClipDistance:
    case SemanticKind::CullDistance:
+   case SemanticKind::PrimitiveID:
 +  case SemanticKind::Barycentrics:
      break;
    default:
      return unsupported("dxil: unsupported loadInput semantic " + std::to_string((uint32_t)signature.semantic_kind));
-@@ -1532,11 +1535,26 @@ Converter::EmitLoadInput(const CallInst &Call) {
+@@ -1555,12 +1558,27 @@ Converter::EmitLoadInput(const CallInst &Call) {
    uint32_t Lane = (uint32_t)signature.start_col + *Component;
    if (Lane > 3)
      return unsupported("dxil: loadInput component out of range");
@@ -327,39 +327,16 @@ index 0722000..973a89b 100644
 +    }
 +  }
  
+   SmallVector<Value *> RegIdxs;
+   RegIdxs.push_back(ir.getInt32(0));
+-  if (!isa<UndefValue>(*GSVertex))
++  if (!AtVertex && !isa<UndefValue>(*GSVertex))
+     RegIdxs.push_back(*GSVertex);
+-  RegIdxs.push_back(ir.getInt32(Reg));
++  RegIdxs.push_back(RegIndex);
+   RegIdxs.push_back(ir.getInt32(Lane));
+ 
    if (Type->isIntegerTy()) {
-     auto *Ptr = ir.CreateGEP(
-         ctx.resource.input.ptr_int4->getType()->getNonOpaquePointerElementType(), ctx.resource.input.ptr_int4,
--        {ir.getInt32(0), ir.getInt32(Reg), ir.getInt32(Lane)}
-+        {ir.getInt32(0), RegIndex, ir.getInt32(Lane)}
-     );
-     auto *Value = ir.CreateLoad(ir.getInt32Ty(), Ptr);
-     if (Type->getIntegerBitWidth() < 32)
-@@ -1548,7 +1566,7 @@ Converter::EmitLoadInput(const CallInst &Call) {
-   if (Type->isFloatTy()) {
-     auto *Ptr = ir.CreateGEP(
-         ctx.resource.input.ptr_float4->getType()->getNonOpaquePointerElementType(), ctx.resource.input.ptr_float4,
--        {ir.getInt32(0), ir.getInt32(Reg), ir.getInt32(Lane)}
-+        {ir.getInt32(0), RegIndex, ir.getInt32(Lane)}
-     );
-     return ir.CreateLoad(ir.getFloatTy(), Ptr);
-   }
-@@ -1556,13 +1574,13 @@ Converter::EmitLoadInput(const CallInst &Call) {
-     if (signature.semantic_kind == SemanticKind::Position) {
-       auto *Ptr = ir.CreateGEP(
-           ctx.resource.input.ptr_float4->getType()->getNonOpaquePointerElementType(), ctx.resource.input.ptr_float4,
--          {ir.getInt32(0), ir.getInt32(Reg), ir.getInt32(Lane)}
-+          {ir.getInt32(0), RegIndex, ir.getInt32(Lane)}
-       );
-       return air.CreateConvertToHalf(ir.CreateLoad(ir.getFloatTy(), Ptr));
-     }
-     auto *Ptr = ir.CreateGEP(
-         ctx.resource.input.ptr_int4->getType()->getNonOpaquePointerElementType(), ctx.resource.input.ptr_int4,
--        {ir.getInt32(0), ir.getInt32(Reg), ir.getInt32(Lane)}
-+        {ir.getInt32(0), RegIndex, ir.getInt32(Lane)}
-     );
-     auto *Value = ir.CreateLoad(ir.getInt32Ty(), Ptr);
-     return ir.CreateBitCast(ir.CreateTrunc(Value, ir.getInt16Ty()), ir.getHalfTy());
 diff --git a/src/airconv/nt/dxil_converter_base.hpp b/src/airconv/nt/dxil_converter_base.hpp
 index ca13f52..3a704ea 100644
 --- a/src/airconv/nt/dxil_converter_base.hpp

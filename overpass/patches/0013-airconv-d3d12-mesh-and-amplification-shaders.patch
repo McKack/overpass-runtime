@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: McKack <4465550+McKack@users.noreply.github.com>
 Date: Mon, 26 Oct 2026 02:25:44 +0100
-Subject: [PATCH] airconv, d3d12: mesh and amplification shaders
+Subject: [PATCH 13/14] airconv, d3d12: mesh and amplification shaders
 
 DXIL mesh shaders become Metal mesh functions and amplification shaders Metal
 object functions; D3D12 gets mesh pipelines from pipeline state streams,
@@ -22,7 +22,7 @@ ID3D12GraphicsCommandList3-6 and DispatchMesh, and reports mesh shader tier 1.
 - airconv -metal32.
 ---
  src/airconv/air_signature.cpp          |   7 +
- src/airconv/air_signature.hpp          |   7 +-
+ src/airconv/air_signature.hpp          |   8 +-
  src/airconv/airconv_cli.cpp            |   4 +-
  src/airconv/airconv_public.h           |   9 +
  src/airconv/dxbc_binding_rootsig.cpp   |   8 +
@@ -37,22 +37,22 @@ ID3D12GraphicsCommandList3-6 and DispatchMesh, and reports mesh shader tier 1.
  src/airconv/nt/dxil_converter_base.cpp |  49 ++--
  src/airconv/nt/dxil_converter_base.hpp |  27 +++
  src/airconv/nt/dxil_converter_mesh.cpp | 299 +++++++++++++++++++++++++
- src/d3d12/d3d12_command_list.cpp       | 160 ++++++++++++-
+ src/d3d12/d3d12_command_list.cpp       | 143 +++++++++++-
  src/d3d12/d3d12_device.cpp             |  26 ++-
  src/d3d12/d3d12_device.hpp             |  10 +-
  src/d3d12/d3d12_pipeline_graphics.cpp  | 204 +++++++++++++----
  src/dxmt/dxmt_command.metal            |   3 +
- 21 files changed, 1104 insertions(+), 75 deletions(-)
+ 21 files changed, 1087 insertions(+), 76 deletions(-)
  create mode 100644 src/airconv/dxil_mesh.hpp
  create mode 100644 src/airconv/nt/dxil_converter_mesh.cpp
 
 diff --git a/src/airconv/air_signature.cpp b/src/airconv/air_signature.cpp
-index 1954d1d..6c73d87 100644
+index 806d2c6..371c157 100644
 --- a/src/airconv/air_signature.cpp
 +++ b/src/airconv/air_signature.cpp
-@@ -631,6 +631,13 @@ auto FunctionSignatureBuilder::CreateFunction(
+@@ -638,6 +638,13 @@ auto FunctionSignatureBuilder::CreateFunction(
                    ->string("air.arg_name")
-                   ->string("mtl_viewport_array_index");
+                   ->string("mtl_primitive_id");
              },
 +            [&](const OutputPrimitiveCulled) {
 +              md.string("air.primitive_culled")
@@ -65,20 +65,21 @@ index 1954d1d..6c73d87 100644
          output
      );
 diff --git a/src/airconv/air_signature.hpp b/src/airconv/air_signature.hpp
-index b117801..f234896 100644
+index b3b9336..ce609c9 100644
 --- a/src/airconv/air_signature.hpp
 +++ b/src/airconv/air_signature.hpp
-@@ -631,7 +631,12 @@ using FunctionOutput = std::variant<
+@@ -635,8 +635,12 @@ using FunctionOutput = std::variant<
  
  using MeshVertexOutput = std::variant<OutputMeshData, OutputPosition, OutputClipDistance, OutputPointSize>;
  
--using MeshPrimitiveOutput = std::variant<OutputMeshData, OutputRenderTargetArrayIndex, OutputViewportArrayIndex>;
+-using MeshPrimitiveOutput =
+-    std::variant<OutputMeshData, OutputRenderTargetArrayIndex, OutputViewportArrayIndex, OutputPrimitiveID>;
 +struct OutputPrimitiveCulled {
 +  bool operator==(OutputPrimitiveCulled const &rhs) const { return true; }
 +};
 +
-+using MeshPrimitiveOutput =
-+    std::variant<OutputMeshData, OutputRenderTargetArrayIndex, OutputViewportArrayIndex, OutputPrimitiveCulled>;
++using MeshPrimitiveOutput = std::variant<
++    OutputMeshData, OutputRenderTargetArrayIndex, OutputViewportArrayIndex, OutputPrimitiveID, OutputPrimitiveCulled>;
  
  class FunctionSignatureBuilder {
  public:
@@ -105,7 +106,7 @@ index 0b903d8..2ee6e6d 100644
    }
  
 diff --git a/src/airconv/airconv_public.h b/src/airconv/airconv_public.h
-index 3171b1f..7085a16 100644
+index 126db4d..13fb22c 100644
 --- a/src/airconv/airconv_public.h
 +++ b/src/airconv/airconv_public.h
 @@ -99,6 +99,14 @@ struct MTL_PIXEL_SHADER_REFLECTION {
@@ -151,7 +152,7 @@ index 5d4c6b7..efe6cda 100644
        break;
      }
 diff --git a/src/airconv/dxbc_converter.cpp b/src/airconv/dxbc_converter.cpp
-index b8ffa9d..caa62a6 100644
+index f94b6a3..94d13b3 100644
 --- a/src/airconv/dxbc_converter.cpp
 +++ b/src/airconv/dxbc_converter.cpp
 @@ -19,6 +19,7 @@
@@ -162,7 +163,7 @@ index b8ffa9d..caa62a6 100644
  #include "metallib_writer.hpp"
  #include "nt/air_builder.hpp"
  #include "shader_common.hpp"
-@@ -812,6 +813,114 @@ llvm::Error convert_dxbc_vertex_shader(
+@@ -809,6 +810,114 @@ llvm::Error convert_dxbc_vertex_shader(
    return llvm::Error::success();
  };
  
@@ -277,7 +278,7 @@ index b8ffa9d..caa62a6 100644
  llvm::Error convertDXBC(
    sm50_shader_t pShader, const char *name, llvm::LLVMContext &context,
    llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
-@@ -844,6 +953,9 @@ llvm::Error convertDXBC(
+@@ -841,6 +950,9 @@ llvm::Error convertDXBC(
      );
    case microsoft::D3D12_SB_MESH_SHADER:
    case microsoft::D3D12_SB_AMPLIFICATION_SHADER:
@@ -288,7 +289,7 @@ index b8ffa9d..caa62a6 100644
      break;
    }
 diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
-index 950ba94..2a4e538 100644
+index 1fca922..2538cda 100644
 --- a/src/airconv/dxil_converter.cpp
 +++ b/src/airconv/dxil_converter.cpp
 @@ -1,6 +1,7 @@
@@ -299,7 +300,7 @@ index 950ba94..2a4e538 100644
  
  #include "llvm/IR/Instructions.h"
  #include "llvm/Support/Error.h"
-@@ -642,6 +643,108 @@ initialize_pixel_signature(dxmt::dxbc::SM50ShaderInternal *shader) {
+@@ -649,6 +650,108 @@ initialize_pixel_signature(dxmt::dxbc::SM50ShaderInternal *shader) {
    return llvm::Error::success();
  }
  
@@ -406,11 +407,11 @@ index 950ba94..2a4e538 100644
 +}
 +
  llvm::Error
- initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
-   using namespace microsoft;
-@@ -663,6 +766,24 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
-     shader->shader_type = microsoft::D3D10_SB_PIXEL_SHADER;
-     if (auto err = initialize_pixel_signature(shader))
+ initialize_geometry_signature(dxmt::dxbc::SM50ShaderInternal *shader) {
+   using namespace dxmt::dxbc;
+@@ -794,6 +897,24 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
+     shader->shader_type = microsoft::D3D10_SB_GEOMETRY_SHADER;
+     if (auto err = initialize_geometry_signature(shader))
        return err;
 +  } else if (info.shader_model.stage == "ms") {
 +    shader->shader_type = microsoft::D3D12_SB_MESH_SHADER;
@@ -433,7 +434,7 @@ index 950ba94..2a4e538 100644
    } else {
      return llvm::make_error<UnsupportedFeature>("dxil: unsupported shader stage " + std::string(stage));
    }
-@@ -940,6 +1061,20 @@ initialize(
+@@ -1078,6 +1199,20 @@ initialize(
        pRefl->ThreadgroupSize[1] = shader->threadgroup_size[1];
        pRefl->ThreadgroupSize[2] = shader->threadgroup_size[2];
        break;
@@ -513,11 +514,11 @@ index 0000000..0aba3c5
 +
 +} // namespace dxmt::dxil
 diff --git a/src/airconv/dxil_metadata.cpp b/src/airconv/dxil_metadata.cpp
-index 04818db..fc3aba2 100644
+index a650205..7b8b361 100644
 --- a/src/airconv/dxil_metadata.cpp
 +++ b/src/airconv/dxil_metadata.cpp
-@@ -252,6 +252,27 @@ parse_property(EntryPropertyTag tag, MetadataReader r) {
-     property.num_threads = *num_threads;
+@@ -264,6 +264,27 @@ parse_property(EntryPropertyTag tag, MetadataReader r) {
+     property.gs_state = *state;
      break;
    }
 +  case EntryPropertyTag::MSState: {
@@ -544,7 +545,7 @@ index 04818db..fc3aba2 100644
    default:
      break;
    }
-@@ -297,6 +318,13 @@ parse_entry_point(MetadataReader r) {
+@@ -309,6 +330,13 @@ parse_entry_point(MetadataReader r) {
      if (!outputs)
        return outputs.takeError();
      ep.outputs = std::move(*outputs);
@@ -559,11 +560,11 @@ index 04818db..fc3aba2 100644
  
    auto resources = parse_resource_group(r.operand(3));
 diff --git a/src/airconv/dxil_metadata.hpp b/src/airconv/dxil_metadata.hpp
-index ff37709..7046713 100644
+index 7920fbb..7ade466 100644
 --- a/src/airconv/dxil_metadata.hpp
 +++ b/src/airconv/dxil_metadata.hpp
-@@ -206,11 +206,28 @@ struct NumThreads {
-   uint32_t z = 0;
+@@ -214,12 +214,29 @@ struct GSState {
+   uint32_t instance_count = 0;
  };
  
 +// MSState (SM 6.5 mesh shaders); topology: 1 line, 2 triangle.
@@ -586,12 +587,13 @@ index ff37709..7046713 100644
    union {
      uint64_t shader_flags;
      NumThreads num_threads;
+     GSState gs_state;
 +    MeshState mesh_state;
 +    AmplificationState amplification_state;
    };
  };
  
-@@ -234,6 +251,7 @@ struct EntryPoint {
+@@ -243,6 +260,7 @@ struct EntryPoint {
    const llvm::Function *function = nullptr;
    std::vector<SignatureElement> inputs;
    std::vector<SignatureElement> outputs;
@@ -612,10 +614,10 @@ index 6133d85..9b4e0ac 100644
   'transforms/simdgroup_implicit_membarrier.cpp',
  ])
 diff --git a/src/airconv/nt/air_builder.cpp b/src/airconv/nt/air_builder.cpp
-index bf31216..e44bacb 100644
+index 29a8936..8d6d569 100644
 --- a/src/airconv/nt/air_builder.cpp
 +++ b/src/airconv/nt/air_builder.cpp
-@@ -1820,6 +1820,24 @@ AIRBuilder::CreateSetMeshPrimitiveCount(Value *Count) {
+@@ -1838,6 +1838,24 @@ AIRBuilder::CreateSetMeshPrimitiveCount(Value *Count) {
    return builder.CreateCall(Fn, {getMeshHandle(), Count});
  }
  
@@ -641,10 +643,10 @@ index bf31216..e44bacb 100644
  AIRBuilder::CreateSetMeshPointSize(Value *Vertex, Value *Size) {
    auto &Context = getContext();
 diff --git a/src/airconv/nt/air_builder.hpp b/src/airconv/nt/air_builder.hpp
-index 3fa6b77..41f7483 100644
+index a70f6d0..a200dae 100644
 --- a/src/airconv/nt/air_builder.hpp
 +++ b/src/airconv/nt/air_builder.hpp
-@@ -337,6 +337,8 @@ public:
+@@ -339,6 +339,8 @@ public:
  
    CallInst *CreateSetMeshPrimitiveCount(Value *Count);
  
@@ -654,7 +656,7 @@ index 3fa6b77..41f7483 100644
  
    enum FPUnOp {
 diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
-index ba07587..aa506b3 100644
+index 472162a..2a6c1ef 100644
 --- a/src/airconv/nt/dxil_converter_base.cpp
 +++ b/src/airconv/nt/dxil_converter_base.cpp
 @@ -67,6 +67,8 @@ Converter::Run(llvm::BasicBlock *ReturnBB) {
@@ -685,7 +687,7 @@ index ba07587..aa506b3 100644
    if (op == "threadId")
      return EmitThreadId(Call, ThreadBuiltin::kGlobalId);
    if (op == "groupId")
-@@ -1355,6 +1369,25 @@ Converter::EmitGetDimensions(CallInst &Call) {
+@@ -1372,6 +1386,25 @@ Converter::EmitGetDimensions(CallInst &Call) {
    return Ret;
  }
  
@@ -711,7 +713,7 @@ index ba07587..aa506b3 100644
  llvm::Expected<llvm::Value *>
  Converter::EmitRawBufferStore(CallInst &Call) {
    auto Handle = ResolveHandleOperand(Call.getArgOperand(1));
-@@ -1385,14 +1418,8 @@ Converter::EmitRawBufferStore(CallInst &Call) {
+@@ -1402,14 +1435,8 @@ Converter::EmitRawBufferStore(CallInst &Call) {
      ByteOffset = ir.CreateAdd(ByteOffset, *ElementOffset);
    }
    bool Coherent = Buffer->GlobalCoherent && SupportsMemoryCoherency();
@@ -727,7 +729,7 @@ index ba07587..aa506b3 100644
  
    for (unsigned i = 0; i < 4; i++) {
      if (!(*Mask & (1u << i)))
-@@ -1437,13 +1464,7 @@ Converter::EmitRawBufferLoad(CallInst &Call) {
+@@ -1454,13 +1481,7 @@ Converter::EmitRawBufferLoad(CallInst &Call) {
    bool Coherent = Buffer->GlobalCoherent && SupportsMemoryCoherency();
    auto *TyStruct = cast<StructType>(MapType(Call.getType()));
    Type *TyElement = TyStruct->getElementType(0);
@@ -1105,7 +1107,7 @@ index 0000000..7a3911e
 +
 +} // namespace dxmt::dxil
 diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
-index b359c56..c4252f2 100644
+index 98f78a9..874e26d 100644
 --- a/src/d3d12/d3d12_command_list.cpp
 +++ b/src/d3d12/d3d12_command_list.cpp
 @@ -20,6 +20,8 @@
@@ -1117,7 +1119,7 @@ index b359c56..c4252f2 100644
  
  namespace dxmt {
  
-@@ -437,7 +439,9 @@ public:
+@@ -518,7 +520,9 @@ public:
  
      if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12DeviceChild) ||
          riid == __uuidof(ID3D12CommandList) || riid == __uuidof(ID3D12GraphicsCommandList) ||
@@ -1128,49 +1130,11 @@ index b359c56..c4252f2 100644
        *ppvObject = ref(this);
        return S_OK;
      }
-@@ -608,6 +612,8 @@ public:
-       cmd_setrs.scole_scale = pso_graphics_->scole_scale;
-       cmd_setrs.winding = pso_graphics_->winding;
- 
-+      if (pso_graphics_->mesh_pipeline)
-+        dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
-       dirty_state_.clr(DirtyState::GraphicsPipelineState);
-     }
-     if (dirty_state_.test(DirtyState::VertexBuffer)) {
-@@ -635,6 +641,8 @@ public:
-         cmd_fsargbuf.buffer = allocator_->gpu_heap_buffer_;
-         cmd_fsargbuf.offset = Offset;
-         cmd_fsargbuf.index = SM50_BINDING_INDEX_ROOT_ARGUMENTS;
-+        if (pso_graphics_->mesh_pipeline)
-+          EncodeMeshStageBuffers(Offset, SM50_BINDING_INDEX_ROOT_ARGUMENTS);
-       }
-       dirty_state_.clr(DirtyState::GraphicsRootArguments);
-     }
-@@ -652,6 +660,8 @@ public:
-         cmd_fsargbuf.buffer = allocator_->gpu_heap_buffer_;
-         cmd_fsargbuf.offset = Offset;
-         cmd_fsargbuf.index = SM50_BINDING_INDEX_STATIC_SAMPLERS;
-+        if (pso_graphics_->mesh_pipeline)
-+          EncodeMeshStageBuffers(Offset, SM50_BINDING_INDEX_STATIC_SAMPLERS);
-       }
-       dirty_state_.clr(DirtyState::GraphicsRootSignature);
-     }
-@@ -730,6 +740,35 @@ public:
+@@ -883,6 +887,24 @@ public:
      cmd_draw.vertex_count = VertexCountPerInstance;
    };
  
 +  // The object (amplification) and mesh stages get the same root argument / static sampler buffers.
-+  void
-+  EncodeMeshStageBuffers(uint64_t Offset, uint8_t Index) {
-+    for (auto type : {WMTRenderCommandSetObjectBuffer, WMTRenderCommandSetMeshBuffer}) {
-+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
-+      cmd.type = type;
-+      cmd.buffer = allocator_->gpu_heap_buffer_;
-+      cmd.offset = Offset;
-+      cmd.index = Index;
-+    }
-+  }
-+
 +  void STDMETHODCALLTYPE
 +  DispatchMesh(UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ) {
 +    if (!pso_graphics_ || !pso_graphics_->mesh_pipeline)
@@ -1191,9 +1155,9 @@ index b359c56..c4252f2 100644
    void STDMETHODCALLTYPE
    DrawIndexedInstanced(
        UINT IndexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, INT BaseVertexLocation,
-@@ -1793,6 +1832,125 @@ public:
-   ) {
-     IMPLEMENT_ME
+@@ -2000,6 +2022,125 @@ public:
+       cmd_cp.copy_length = sizeof(uint32_t);
+     }
    }
 +
 +  // ID3D12GraphicsCommandList3
@@ -1318,10 +1282,10 @@ index b359c56..c4252f2 100644
  
  HRESULT STDMETHODCALLTYPE
 diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
-index c9f3f2a..d58e286 100644
+index a333e3d..affd6a9 100644
 --- a/src/d3d12/d3d12_device.cpp
 +++ b/src/d3d12/d3d12_device.cpp
-@@ -387,7 +387,7 @@ public:
+@@ -392,7 +392,7 @@ public:
        if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7))
          return E_INVALIDARG;
        auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7 *>(pFeatureData);
@@ -1330,7 +1294,7 @@ index c9f3f2a..d58e286 100644
        out->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
        return S_OK;
      }
-@@ -946,6 +946,7 @@ public:
+@@ -951,6 +951,7 @@ public:
  
      D3D12_COMPUTE_PIPELINE_STATE_DESC desc_cs{};
      D3D12_GRAPHICS_PIPELINE_STATE_DESC desc_graphics{};
@@ -1338,7 +1302,7 @@ index c9f3f2a..d58e286 100644
      {
        desc_graphics.DepthStencilState.DepthEnable = TRUE;
        desc_graphics.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-@@ -1127,18 +1128,12 @@ public:
+@@ -1132,18 +1133,12 @@ public:
        }
        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: {
          GET_STREAM_DATA(D3D12_SHADER_BYTECODE);
@@ -1359,7 +1323,7 @@ index c9f3f2a..d58e286 100644
          break;
        }
        default:
-@@ -1158,6 +1153,19 @@ public:
+@@ -1163,6 +1158,19 @@ public:
        return CreateComputePipelineState(&desc_cs, riid, ppPipelineState);
      }
  
@@ -1380,7 +1344,7 @@ index c9f3f2a..d58e286 100644
    }
  
 diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
-index 0d67b3d..8c65e17 100644
+index 7c7c287..a19d0b0 100644
 --- a/src/d3d12/d3d12_device.hpp
 +++ b/src/d3d12/d3d12_device.hpp
 @@ -41,7 +41,7 @@
@@ -1393,9 +1357,9 @@ index 0d67b3d..8c65e17 100644
    EncoderData *entry;
    size_t encoder_count;
 @@ -154,6 +154,10 @@ public:
-   float scole_scale;
    float depth_bias_clamp;
    uint32_t forced_sample_count;
+   bool is_geometry = 0;
 +  // Mesh pipelines (DispatchMesh): threads per object (amplification) and mesh threadgroup.
 +  bool mesh_pipeline = false;
 +  WMTSize object_threadgroup_size = {1, 1, 1};
@@ -1403,7 +1367,7 @@ index 0d67b3d..8c65e17 100644
  
    virtual WMT::DepthStencilState GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) = 0;
  
-@@ -280,9 +284,11 @@ CreateCommandSignature(
+@@ -284,9 +288,11 @@ CreateCommandSignature(
      REFIID riid, void **ppCommandSignature
  );
  
@@ -1417,10 +1381,10 @@ index 0d67b3d..8c65e17 100644
  
  HRESULT
 diff --git a/src/d3d12/d3d12_pipeline_graphics.cpp b/src/d3d12/d3d12_pipeline_graphics.cpp
-index 54da527..e12c047 100644
+index 252df58..069865f 100644
 --- a/src/d3d12/d3d12_pipeline_graphics.cpp
 +++ b/src/d3d12/d3d12_pipeline_graphics.cpp
-@@ -461,6 +461,156 @@ public:
+@@ -463,6 +463,156 @@ public:
      forced_sample_count = pDesc->RasterizerState.ForcedSampleCount;
    }
  
@@ -1577,7 +1541,7 @@ index 54da527..e12c047 100644
    virtual HRESULT
    Initialize(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
      if (pDesc->StreamOutput.NumEntries) {
-@@ -480,7 +630,7 @@ public:
+@@ -482,7 +632,7 @@ public:
  
      HRESULT hr;
  
@@ -1586,7 +1550,7 @@ index 54da527..e12c047 100644
      SM50Error sm50_err;
      auto metal = device_->GetMTLDevice();
      WMT::Reference<WMT::Error> err;
-@@ -556,50 +706,8 @@ public:
+@@ -558,50 +708,8 @@ public:
      if (FAILED(hr = InitializePSO(pDesc, info, dual_source_blending)))
        return hr;
  
@@ -1639,7 +1603,7 @@ index 54da527..e12c047 100644
  
      // PSO
      {
-@@ -678,11 +786,13 @@ public:
+@@ -935,7 +1043,8 @@ public:
  
  HRESULT
  CreateGraphicsPipelineState(
@@ -1648,7 +1612,11 @@ index 54da527..e12c047 100644
 +    const D3D12_SHADER_BYTECODE *pAS, const D3D12_SHADER_BYTECODE *pMS
  ) {
    InitReturnPtr(ppPipelineState);
-   auto pso = Com(new MTLD3D12GraphicsPipelineStateImpl(pDevice));
+   Com<MTLD3D12GraphicsPipelineStateImpl> pso;
+@@ -943,7 +1052,8 @@ CreateGraphicsPipelineState(
+     pso = Com<MTLD3D12GraphicsPipelineStateImpl>(new MTLD3D12GeometryGraphicsPipelineStateImpl(pDevice));
+   else
+     pso = Com(new MTLD3D12GraphicsPipelineStateImpl(pDevice));
 -  HRESULT hr = pso->Initialize(pDesc);
 +  HRESULT hr = pMS && pMS->pShaderBytecode ? pso->InitializeMesh(pDesc, pAS ? *pAS : D3D12_SHADER_BYTECODE{}, *pMS)
 +                                           : pso->Initialize(pDesc);
@@ -1670,5 +1638,5 @@ index 516f49e..508b5d6 100644
    constant float4& clear_value [[buffer(kCustomBufferArgumentIndex0)]]
  ) {
 -- 
-2.54.0 (Apple Git-157)
+2.50.1 (Apple Git-155)
 

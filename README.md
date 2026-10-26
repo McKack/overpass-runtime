@@ -23,14 +23,14 @@ other CrossOver-derived Wine builds.
 
 ## Status
 
-Early. It builds on a Mac and passes its smoke test (`tests/smoke.c`) under OverPass Wine:
+Early. It builds on a Mac and passes its tests (`tests/run-all.sh`) under OverPass Wine:
 
 - **D3D10/11 and DXGI:** DXMT's, unchanged.
 - **D3D12:** feature level 12_0 on macOS 26.4 or later (tiled resources tier 2 through Metal placement
   sparse resources; OverPass's addition), 11_1 before that. Shader model 6.8: 26 of the 27 shader model
   6.x features in `tests/sm6` convert (wave ops, 16-bit types, SM 6.6 resource handles and
   `ResourceDescriptorHeap`/`SamplerDescriptorHeap`, 64-bit atomics on buffers and groupshared memory,
-  barycentrics, mesh and amplification shaders, and the 6.7/6.8 sampling ops). The one that doesn't,
+  barycentrics, mesh and amplification shaders, and the 6.7/6.8 sampling ops). Geometry shaders (DXMT's). The one that doesn't,
   writable MSAA textures (6.7, optional), can't be done on Metal and isn't reported. Mesh shader tier 1.
   Not yet: 64-bit atomics on typed (`R64_UINT`) textures, raytracing, variable rate shading.
 - **DLSS → MetalFX:** Super Resolution in D3D11 and D3D12 games (D3D12 is OverPass's addition). Not yet:

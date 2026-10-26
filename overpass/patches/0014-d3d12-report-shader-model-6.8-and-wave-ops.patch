@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: McKack <4465550+McKack@users.noreply.github.com>
 Date: Mon, 26 Oct 2026 02:44:33 +0100
-Subject: [PATCH] d3d12: report shader model 6.8 and wave ops
+Subject: [PATCH 14/14] d3d12: report shader model 6.8 and wave ops
 
 CheckFeatureSupport(SHADER_MODEL) answers any model from 5.1 to 6.9 with the
 lower of it and 6.8, as games expect when they probe, instead of failing above
@@ -11,10 +11,10 @@ lower of it and 6.8, as games expect when they probe, instead of failing above
  1 file changed, 10 insertions(+), 6 deletions(-)
 
 diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
-index d58e286..9e67b5c 100644
+index affd6a9..42d7d28 100644
 --- a/src/d3d12/d3d12_device.cpp
 +++ b/src/d3d12/d3d12_device.cpp
-@@ -297,9 +297,12 @@ public:
+@@ -301,9 +301,12 @@ public:
        if (DataSize != sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
          return E_INVALIDARG;
        auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(pFeatureData);
@@ -29,7 +29,7 @@ index d58e286..9e67b5c 100644
        return S_OK;
      }
      case D3D12_FEATURE_D3D12_OPTIONS: {
-@@ -355,10 +358,11 @@ public:
+@@ -360,10 +363,11 @@ public:
        if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS1))
          return E_INVALIDARG;
        auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS1 *>(pFeatureData);

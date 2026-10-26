@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: McKack <4465550+McKack@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 21:10:07 +0100
-Subject: [PATCH] airconv: SM 6.6 resource handles (createHandleFromBinding,
- annotateHandle)
+Subject: [PATCH 05/14] airconv: SM 6.6 resource handles
+ (createHandleFromBinding, annotateHandle)
 
 Shaders compiled for shader model 6.6 and later name resources by binding
 (class, space, lower bound) and wrap handles in annotateHandle. Both now
@@ -15,7 +15,7 @@ in code generation, so these shaders get as far as SM 6.0 ones do.
  3 files changed, 74 insertions(+), 4 deletions(-)
 
 diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
-index 76ae758..ef7fe61 100644
+index a9e2dc6..b7fd7aa 100644
 --- a/src/airconv/dxil_converter.cpp
 +++ b/src/airconv/dxil_converter.cpp
 @@ -78,8 +78,29 @@ to_shader_resource_type(ResourceKind kind) {
@@ -60,7 +60,7 @@ index 76ae758..ef7fe61 100644
        return unsupported("dxil: unsupported resource handle operation " + name.str());
      }
    }
-@@ -657,7 +682,7 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
+@@ -795,7 +820,7 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
          continue;
  
        auto record_usage = [&](bool read, bool written, bool sampled, bool compared) -> llvm::Error {
@@ -69,7 +69,7 @@ index 76ae758..ef7fe61 100644
          if (!key)
            return key.takeError();
          switch ((ResourceClass)key->first) {
-@@ -685,8 +710,10 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
+@@ -823,8 +848,10 @@ initialize_shader(dxmt::dxbc::SM50ShaderInternal *shader, const Info &info) {
        };
  
        switch (*opcode) {
@@ -83,7 +83,7 @@ index 76ae758..ef7fe61 100644
            return key.takeError();
          break;
 diff --git a/src/airconv/nt/dxil_converter_base.cpp b/src/airconv/nt/dxil_converter_base.cpp
-index 7bf1752..5a55028 100644
+index 07b9cfa..8af1e00 100644
 --- a/src/airconv/nt/dxil_converter_base.cpp
 +++ b/src/airconv/nt/dxil_converter_base.cpp
 @@ -787,6 +787,10 @@ Converter::EmitDxilOp(CallInst &Call) {
@@ -97,7 +97,7 @@ index 7bf1752..5a55028 100644
    if (op == "cbufferLoadLegacy")
      return EmitCbufferLoadLegacy(Call);
    if (op == "threadId")
-@@ -888,6 +892,43 @@ Converter::EmitCreateHandle(CallInst &Call) {
+@@ -905,6 +909,43 @@ Converter::EmitCreateHandle(CallInst &Call) {
    return (llvm::Value *)nullptr;
  }
  
