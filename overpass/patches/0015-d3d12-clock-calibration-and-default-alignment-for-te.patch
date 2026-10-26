@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 19:01:38 +0100
+Subject: [PATCH] d3d12: clock calibration, and default alignment for textures
+ Metal can't fit in 4 KB
+
+GetClockCalibration returned E_NOTIMPL and GetTimestampFrequency 1; Unreal Engine's D3D12 renderer stops with a fatal error on the first. Both clocks now come from the performance counter, GPU time in nanoseconds as D3D11 timestamps are. A texture that asks for the small (4 KB) placement alignment but needs more than 64 KB in Metal is created with the default alignment instead of failing; Unreal decides on 4 KB by D3D12's own size estimate. GetResourceAllocationInfo logs textures it can't place. Verified: Ghostrunner (UE4) on D3D12 gets to its menus.
+---
+ src/d3d12/d3d12_command_queue.cpp | 20 ++++++++++++++++----
+ src/d3d12/d3d12_device.cpp        |  6 ++++--
+ src/d3d12/d3d12_texture.cpp       |  6 ++++--
+ 3 files changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
+index 340d581..6297604 100644
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -554,15 +554,27 @@ public:
+ 
+   HRESULT STDMETHODCALLTYPE
+   GetTimestampFrequency(UINT64 *pFrequency) {
+-    // FIXME: stub
+-    if (pFrequency)
+-      *pFrequency = 1;
++    // GPU timestamps are in nanoseconds, as D3D11 timestamp queries are (Metal's command buffer GPU times).
++    if (!pFrequency)
++      return E_INVALIDARG;
++    *pFrequency = 1000000000;
+     return S_OK;
+   };
+ 
+   HRESULT STDMETHODCALLTYPE
+   GetClockCalibration(UINT64 *gpu_timestamp, UINT64 *cpu_timestamp) {
+-    return E_NOTIMPL;
++    // Unreal Engine's D3D12 renderer stops with a fatal error when this fails. Both clocks are taken from the
++    // performance counter, the GPU one converted to nanoseconds (GetTimestampFrequency), so the pair is
++    // consistent; D3D12 timestamp queries don't record GPU times yet.
++    if (!gpu_timestamp || !cpu_timestamp)
++      return E_INVALIDARG;
++    LARGE_INTEGER counter, frequency;
++    QueryPerformanceCounter(&counter);
++    QueryPerformanceFrequency(&frequency);
++    *cpu_timestamp = counter.QuadPart;
++    *gpu_timestamp = (UINT64)counter.QuadPart / frequency.QuadPart * 1000000000 +
++                     (UINT64)counter.QuadPart % frequency.QuadPart * 1000000000 / frequency.QuadPart;
++    return S_OK;
+   };
+ 
+   D3D12_COMMAND_QUEUE_DESC *STDMETHODCALLTYPE
+diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
+index 42d7d28..97e9e35 100644
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -1250,7 +1250,7 @@ public:
+ 
+       if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+         if (desc->Alignment && desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
+-          DEBUG("GetResourceAllocationInfo: invalid alignment ", desc->Alignment, " for buffer resource.\n");
++          WARN("GetResourceAllocationInfo: invalid alignment ", desc->Alignment, " for buffer resource.");
+           goto invalid;
+         }
+         resource_info.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+@@ -1259,7 +1259,9 @@ public:
+       } else {
+         WMTTextureInfo texture_info;
+         if (FAILED(PopulateWMTTextureInfo(GetMTLDevice(), texture_info, *desc))) {
+-          DEBUG("GetResourceAllocationInfo: invalid texture descriptor\n");
++          WARN("GetResourceAllocationInfo: unsupported texture: dimension ", desc->Dimension, ", format ", desc->Format,
++               ", ", desc->Width, "x", desc->Height, "x", desc->DepthOrArraySize, ", mips ", desc->MipLevels,
++               ", samples ", desc->SampleDesc.Count, ", flags ", desc->Flags, ", alignment ", desc->Alignment);
+           goto invalid;
+         }
+         auto size_and_align = GetMTLDevice().heapTextureSizeAndAlign(texture_info);
+diff --git a/src/d3d12/d3d12_texture.cpp b/src/d3d12/d3d12_texture.cpp
+index f92ca40..8915eaf 100644
+--- a/src/d3d12/d3d12_texture.cpp
++++ b/src/d3d12/d3d12_texture.cpp
+@@ -144,9 +144,11 @@ PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, const D3D12_
+       info_one_slice.array_length = 1;
+       auto size_and_align = Device.heapTextureSizeAndAlign(info_one_slice);
+       // Applications can create smaller aligned resources when the estimated size of the most-detailed mip level is a
+-      // total of the larger alignment restriction or less.
++      // total of the larger alignment restriction or less. D3D12 estimates that size itself, so a texture can qualify
++      // in D3D12 while Metal needs more than 64 KB for it (Unreal Engine decides on 4 KB by its own estimate). Such
++      // a texture gets the default alignment instead, which GetResourceAllocationInfo then reports.
+       if (size_and_align.size > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+-        return E_INVALIDARG;
++        return S_OK;
+     }
+   }
+ 
+-- 
+2.50.1 (Apple Git-155)
+
