@@ -6,6 +6,8 @@ Game Porting Toolkit:
 - Direct3D 10, 11 and 12, and DXGI, translated to Metal;
 - NVIDIA DLSS calls served by Apple's MetalFX upscaler;
 - NVAPI, for games that look for an NVIDIA GPU.
+- Direct3D 9 (32- and 64-bit games) through [mtld3d](https://github.com/athei/mtld3d) by Alexander Theißen,
+  an unchanged release pinned in `overpass/mtld3d.pin` (zlib License), in the package's `mtld3d/` folder.
 
 OverPass Runtime is built on [DXMT](https://github.com/3Shain/dxmt) by Feifan He and contributors. It's
 DXMT's main branch with its optional D3D12, NVAPI and NGX parts enabled, plus OverPass's own additions.

@@ -1,0 +1,3 @@
+# mtld3d (https://github.com/athei/mtld3d, Zlib): Direct3D 9 on Metal, shipped unchanged in the runtime's mtld3d/.
+version=v0.15.1
+sha256=115d9089323b20010738d2b4835e79e6652d41690c4b360141e8b0433faff972
