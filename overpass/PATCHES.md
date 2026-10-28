@@ -1,6 +1,6 @@
 # Patches
 
-OverPass Runtime is DXMT at the commit pinned in `dxmt/`, plus the patches in `patches/`.
+overpass-runtime is DXMT at the commit pinned in `dxmt/`, plus the patches in `patches/`.
 `build.sh` applies them in order to the pinned checkout before building (a patch that is already applied is skipped).
 New patches: change `dxmt/`, then `overpass/make-patch.sh "subject" "body"` writes the next numbered patch from it.
 To start over from a clean DXMT, run `git -C dxmt checkout -- . && git -C dxmt clean -fd`.

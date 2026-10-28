@@ -1,4 +1,4 @@
-# OverPass Runtime
+# overpass-runtime
 
 Free and open-source DirectX → Metal for running Windows games on macOS, with no dependency on Apple's
 Game Porting Toolkit:
@@ -9,9 +9,9 @@ Game Porting Toolkit:
 - Direct3D 9 (32- and 64-bit games) through [mtld3d](https://github.com/athei/mtld3d) by Alexander Theißen,
   an unchanged release pinned in `overpass/mtld3d.pin` (zlib License), in the package's `mtld3d/` folder.
 
-OverPass Runtime is built on [DXMT](https://github.com/3Shain/dxmt) by Feifan He and contributors. It's
+overpass-runtime is built on [DXMT](https://github.com/3Shain/dxmt) by Feifan He and contributors. It's
 DXMT's main branch with its optional D3D12, NVAPI and NGX parts enabled, plus OverPass's own additions.
-It's built for, and tested with, [OverPass Wine](https://github.com/McKack/overpass-wine), and works with
+It's built for, and tested with, [overpass-wine](https://github.com/McKack/overpass-wine), and works with
 other CrossOver-derived Wine builds.
 
 ## Who it's for
@@ -21,11 +21,11 @@ other CrossOver-derived Wine builds.
 - **Developers:** download a release and ship your Windows build on the Mac inside a Wine wrapper, using
   only open-source parts.
 - **Other Wine-based projects:** use it under the license below. Keep the copyright notices and credit
-  DXMT and OverPass Runtime.
+  DXMT and overpass-runtime.
 
 ## Status
 
-Early. It builds on a Mac and passes its tests (`tests/run-all.sh`) under OverPass Wine:
+Early. It builds on a Mac and passes its tests (`tests/run-all.sh`) under overpass-wine:
 
 - **D3D10/11 and DXGI:** DXMT's, unchanged.
 - **D3D12:** feature level 12_0 on macOS 26.4 or later (tiled resources tier 2 through Metal placement
