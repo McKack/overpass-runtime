@@ -1,12 +1,14 @@
 #!/bin/bash
 # Builds OverPass Runtime (DXMT main with D3D12, NVAPI and NGX on) on a Mac with Xcode, its Metal toolchain
 # (xcodebuild -downloadComponent MetalToolchain), Homebrew's mingw-w64, cmake, ninja and meson.
-# Toolchains are built or downloaded once into $TOOLCHAINS. Output: $PREFIX/{x86_64-windows,x86_64-unix}.
+# Toolchains are built or downloaded once into $TOOLCHAINS. Output: $PREFIX/{x86_64-windows,x86_64-unix,i386-windows}.
+# The 32-bit set is Direct3D 10/11 only; its winemetal.dll reaches the 64-bit winemetal.so through Wine's WoW64.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 TOOLCHAINS="${TOOLCHAINS:-$SRC/../toolchains}"
 BUILD="${BUILD:-$SRC/../build/x64}"
+BUILD32="${BUILD32:-$SRC/../build/x86}"
 PREFIX="${PREFIX:-$SRC/../install}"
 LLVM_VERSION=llvmorg-15.0.7
 WINE_URL=https://github.com/3Shain/wine/releases/download/v8.16-3shain/wine.tar.gz  # what DXMT's CI builds against
@@ -54,4 +56,11 @@ if [ ! -f "$BUILD/build.ninja" ]; then
 fi
 meson compile -C "$BUILD"
 meson install -C "$BUILD" --quiet
+if [ ! -f "$BUILD32/build.ninja" ]; then
+    meson setup --cross-file build-win32.txt --buildtype release --strip --prefix "$PREFIX" \
+        -Denable_d3d12=false -Denable_nvapi=false -Denable_nvngx=false \
+        -Dnative_llvm_path="$TOOLCHAINS/llvm-darwin" -Dwine_install_path="$TOOLCHAINS/wine" "$BUILD32"
+fi
+meson compile -C "$BUILD32"
+meson install -C "$BUILD32" --quiet
 echo "Installed to $PREFIX"

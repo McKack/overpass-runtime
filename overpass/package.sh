@@ -10,8 +10,9 @@ STAGE=$(mktemp -d)/$NAME
 PIN=$(git -C "$REPO/dxmt" rev-parse --short HEAD)
 PATCHES=$(cd "$REPO/overpass/patches" && ls *.patch)
 
-mkdir -p "$STAGE/x86_64-windows" "$STAGE/x86_64-unix" "$OUT"
+mkdir -p "$STAGE/x86_64-windows" "$STAGE/i386-windows" "$STAGE/x86_64-unix" "$OUT"
 cp "$INSTALL"/x86_64-windows/*.dll "$STAGE/x86_64-windows/"
+cp "$INSTALL"/i386-windows/*.dll "$STAGE/i386-windows/"
 cp "$INSTALL"/x86_64-unix/winemetal.so "$STAGE/x86_64-unix/"
 cp "$REPO/LICENSE" "$STAGE/LICENSE"
 cp "$REPO/dxmt/LICENSE.OLD" "$STAGE/LICENSE.DXMT-OLD"
@@ -60,12 +61,16 @@ Patches:
 $(echo "$PATCHES" | sed 's/^/  /')
 
 Requirements: macOS on Apple silicon, OverPass Wine or another Wine that DXMT supports.
-64-bit games only. Tiled resources need macOS 26.4 or later.
+32-bit games get Direct3D 10/11; Direct3D 12, NVAPI and DLSS are 64-bit only. Tiled resources need macOS
+26.4 or later.
 
 Install, either:
   - OverPass Wine: set OVERPASS_DLL_PATH_PREPEND=/path/to/$NAME for the game, or
-  - copy x86_64-windows/*.dll into <prefix>/drive_c/windows/system32 and x86_64-unix/winemetal.so
-    into Wine's lib/wine/x86_64-unix, then set dxgi, d3d11, d3d10core, d3d12 to native.
+  - copy x86_64-windows/*.dll into <prefix>/drive_c/windows/system32, i386-windows/*.dll into its
+    syswow64 and x86_64-unix/winemetal.so into Wine's lib/wine/x86_64-unix, then set dxgi, d3d11,
+    d3d10core, d3d12 to native.
+With OverPass Wine, winemetal.dll still needs a copy in system32 and syswow64: Wine only loads a builtin
+that the prefix has a file for.
 NVAPI and DLSS are off unless DXMT_ENABLE_NVEXT=1 is set.
 
 Direct3D 9 (32- and 64-bit games): put mtld3d/ first in OVERPASS_DLL_PATH_PREPEND

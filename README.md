@@ -27,7 +27,7 @@ other CrossOver-derived Wine builds.
 
 Early. It builds on a Mac and passes its tests (`tests/run-all.sh`) under overpass-wine:
 
-- **D3D10/11 and DXGI:** DXMT's, unchanged.
+- **D3D10/11 and DXGI:** DXMT's, unchanged, for 64-bit and 32-bit games. D3D12, NVAPI and DLSS are 64-bit only.
 - **D3D12:** feature level 12_0 on macOS 26.4 or later (tiled resources tier 2 through Metal placement
   sparse resources; OverPass's addition), 11_1 before that. Shader model 6.8: 26 of the 27 shader model
   6.x features in `tests/sm6` convert (wave ops, 16-bit types, SM 6.6 resource handles and

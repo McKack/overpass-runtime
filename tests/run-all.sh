@@ -25,6 +25,7 @@ fi
 CXX=(x86_64-w64-mingw32-g++ -O1 -static -I"$SRC/dxmt/src/nvngx" -I"$SRC/dxmt/external/nvapi")
 x86_64-w64-mingw32-gcc -O1 -static -I"$SRC/dxmt/external/nvapi" "$TESTS/smoke.c" -o "$BIN/smoke.exe" \
     -ld3d11 -ld3d12 -ldxgi -luuid || exit 1
+i686-w64-mingw32-gcc -O1 -static "$TESTS/smoke32.c" -o "$BIN/smoke32.exe" -ld3d11 -ldxgi -luuid || exit 1
 for t in tiled12 dlss12 heap12 bary12 atomic12 mesh12 gs12 query12 sm6pso; do
     "${CXX[@]}" "$TESTS/$t.cpp" -o "$BIN/$t.exe" -ld3d12 -ldxgi -luuid || exit 1
 done
@@ -38,6 +39,10 @@ export WINEDLLPATH="$LIB/x86_64-windows:$LIB"
 for dll in "$INSTALL"/x86_64-windows/*.dll; do
     name="$(basename "$dll" | tr A-Z a-z)"
     [ -f "$WINEPREFIX/drive_c/windows/system32/$name" ] || cp "$dll" "$WINEPREFIX/drive_c/windows/system32/$name"
+done
+for dll in "$INSTALL"/i386-windows/*.dll; do
+    name="$(basename "$dll" | tr A-Z a-z)"
+    [ -f "$WINEPREFIX/drive_c/windows/syswow64/$name" ] || cp "$dll" "$WINEPREFIX/drive_c/windows/syswow64/$name"
 done
 
 DXC=("$WINE" "$WORK/dxc/bin/x64/dxc.exe" -nologo)
@@ -60,7 +65,7 @@ compile query12.hlsl vs_6_0 vs_main query12_vs.cso
 compile query12.hlsl ps_6_0 ps_main query12_ps.cso
 
 FAILED=()
-for run in smoke tiled12 dlss12 "dlss12 hires-mv" heap12 bary12 atomic12 mesh12 gs12 query12; do
+for run in smoke smoke32 tiled12 dlss12 "dlss12 hires-mv" heap12 bary12 atomic12 mesh12 gs12 query12; do
     echo "=== $run"
     set -- $run
     "$WINE" "$1.exe" "${@:2}" 2>&1 | tr -d '\r' | grep -v "^ok  " ; status=${PIPESTATUS[0]}
