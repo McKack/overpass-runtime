@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: McKack <4465550+McKack@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:16:04 +0100
+Subject: [PATCH] frame times in a small file per program, for ratings
+
+Written to C:\users\Public\OverPass\Frames every five seconds from both swapchains.
+---
+ src/d3d11/d3d11_swapchain.cpp |  3 ++
+ src/d3d12/d3d12_swapchain.cpp |  3 ++
+ src/dxmt/dxmt_frame_log.hpp   | 88 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 94 insertions(+)
+ create mode 100644 src/dxmt/dxmt_frame_log.hpp
+
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index 86cf466..76b5469 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -8,6 +8,7 @@
+ #include "d3d11_context.hpp"
+ #include "dxmt_context.hpp"
+ #include "dxmt_hud_state.hpp"
++#include "dxmt_frame_log.hpp"
+ #include "dxmt_statistics.hpp"
+ #include "dxmt_presenter.hpp"
+ #include "log/log.hpp"
+@@ -754,6 +755,8 @@ public:
+     if (PresentFlags & DXGI_PRESENT_TEST)
+       return hr;
+ 
++    FrameLog::instance().present();
++
+     if (should_exit_fs)
+       SetFullscreenState(FALSE, nullptr);
+ 
+diff --git a/src/d3d12/d3d12_swapchain.cpp b/src/d3d12/d3d12_swapchain.cpp
+index 080fff1..af77a14 100644
+--- a/src/d3d12/d3d12_swapchain.cpp
++++ b/src/d3d12/d3d12_swapchain.cpp
+@@ -19,6 +19,7 @@
+ #include "d3d12_device.hpp"
+ #include "dxgi_interfaces.h"
+ #include "dxgi_object.hpp"
++#include "dxmt_frame_log.hpp"
+ #include "dxmt_hud_state.hpp"
+ #include "dxmt_presenter.hpp"
+ #include "dxmt_info.hpp"
+@@ -709,6 +710,8 @@ public:
+     if (PresentFlags & DXGI_PRESENT_TEST)
+       return hr;
+ 
++    FrameLog::instance().present();
++
+     double vsync_duration = std::max(
+         SyncInterval * 1.0 / (preferred_max_frame_rate ? preferred_max_frame_rate : init_refresh_rate_),
+         preferred_max_frame_rate ? 1.0 / preferred_max_frame_rate : 0
+diff --git a/src/dxmt/dxmt_frame_log.hpp b/src/dxmt/dxmt_frame_log.hpp
+new file mode 100644
+index 0000000..5588eda
+--- /dev/null
++++ b/src/dxmt/dxmt_frame_log.hpp
+@@ -0,0 +1,88 @@
++#pragma once
++
++// Frame times of a run, for OverPass's ratings: one small text file per program, rewritten every few seconds so it
++// survives however the game ends. Gaps of a second or more (loading, the game in the background) don't count.
++
++#include <windows.h>
++#include <array>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <mutex>
++
++namespace dxmt {
++
++class FrameLog {
++public:
++  static FrameLog &
++  instance() {
++    static FrameLog log;
++    return log;
++  }
++
++  void
++  present() {
++    auto now = clock::now();
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (last_ != clock::time_point{}) {
++      double ms = std::chrono::duration<double, std::milli>(now - last_).count();
++      if (ms < kGap) {
++        if (frames_)
++          jitter_ += std::fabs(ms - previous_);
++        previous_ = ms;
++        total_ += ms;
++        frames_ += 1;
++        buckets_[static_cast<size_t>(ms * kPerMillisecond)] += 1;
++      }
++    }
++    last_ = now;
++    if (frames_ && now - written_ >= std::chrono::seconds(5)) {
++      written_ = now;
++      write();
++    }
++  }
++
++private:
++  using clock = std::chrono::steady_clock;
++  static constexpr double kGap = 1000;
++  static constexpr double kPerMillisecond = 2;
++
++  void
++  write() {
++    uint64_t seen = 0, slowest = frames_ / 100;
++    size_t bucket = buckets_.size();
++    while (bucket > 0 && seen <= slowest)
++      seen += buckets_[--bucket];
++    double p99 = (bucket + 1) / kPerMillisecond;
++
++    char text[128];
++    int size = snprintf(text, sizeof(text), "fps=%.1f low=%.1f ms=%.1f p99=%.1f jitter=%.1f seconds=%.0f\n",
++                        frames_ * 1000.0 / total_, 1000.0 / p99, total_ / frames_, p99, jitter_ / frames_, total_ / 1000.0);
++
++    wchar_t program[MAX_PATH], path[MAX_PATH + 64];
++    if (!GetModuleFileNameW(nullptr, program, MAX_PATH))
++      return;
++    wchar_t *name = wcsrchr(program, L'\\');
++    name = name ? name + 1 : program;
++    if (wchar_t *dot = wcsrchr(name, L'.'))
++      *dot = 0;
++    CreateDirectoryW(L"C:\\users\\Public\\OverPass", nullptr);
++    CreateDirectoryW(L"C:\\users\\Public\\OverPass\\Frames", nullptr);
++    _snwprintf(path, MAX_PATH + 64, L"C:\\users\\Public\\OverPass\\Frames\\%ls.txt", name);
++    HANDLE file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (file == INVALID_HANDLE_VALUE)
++      return;
++    DWORD written;
++    WriteFile(file, text, size, &written, nullptr);
++    CloseHandle(file);
++  }
++
++  std::mutex mutex_;
++  clock::time_point last_{}, written_ = clock::now();
++  double previous_ = 0, total_ = 0, jitter_ = 0;
++  uint64_t frames_ = 0;
++  std::array<uint32_t, 2000> buckets_{};
++};
++
++} // namespace dxmt
+-- 
+2.50.1 (Apple Git-155)
+
